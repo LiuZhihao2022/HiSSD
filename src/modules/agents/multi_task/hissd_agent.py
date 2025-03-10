@@ -695,7 +695,7 @@ class PlannerModel(nn.Module):
 
         commit_loss = th.tensor(0.).to(inputs.device)
         if self.vq_skill:
-            outputs, commit_loss = self.skill_module(outputs)
+            outputs, skill_index, commit_loss = self.skill_module(outputs)
 
         own_out_h = outputs[:, -1, 0].unsqueeze(1)
         enemy_out_h = outputs[:, -1, 1:1+n_enemy]
@@ -708,7 +708,7 @@ class PlannerModel(nn.Module):
             out_loss = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
                                        t=t, actions=actions)
             out_loss += commit_loss
-
+        # TODO:out_loss也就是外面的obs_loss，是rec_loss和commit_loss的和。我需要加上reward model作为奖励预测的loss
         return [own_out_h, enemy_out_h, ally_out_h], h, out_loss
 
 

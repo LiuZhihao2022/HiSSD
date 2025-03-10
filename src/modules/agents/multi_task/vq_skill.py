@@ -22,6 +22,7 @@ class SkillModule(nn.Module):
         self.vq_coef = 0.05
         self.skill_encoder = MLPNet(self.entity_embed_dim, self.code_dim, 128)
         self.skill_decoder = MLPNet(self.code_dim, self.entity_embed_dim, 128)
+        # vector quantilization used here
         self.emb = NearestEmbedEMA(self.skill_dim, self.code_dim) if self.vq_ema else NearestEmbed(self.skill_dim, self.code_dim)
         self.all_params = list(self.emb.parameters()) + list(self.skill_encoder.parameters()) + list(self.skill_decoder.parameters())
 
@@ -30,11 +31,11 @@ class SkillModule(nn.Module):
         shape = list(emb_inputs.shape)
         z_e = self.skill_encoder(emb_inputs).reshape(-1, self.code_dim)
 
-        if self.vq_ema:
-            emb, _ = self.emb(z_e, training=True)
+        if self.vq_ema: # TODO:在使用的时候，要把这个改成False，codebook保持不变了
+            emb, skill_index = self.emb(z_e, training=True)
             commit_loss = F.mse_loss(z_e, emb.detach())
             emb = self.skill_decoder(emb).reshape(*list(shape))
-            return emb, self.comit_coef*commit_loss
+            return emb, skill_index, self.comit_coef*commit_loss
             # recon = self.skill_decoder(emb).mean
 
             # rec_loss = F.mse_loss(recon, seq['deter'])
@@ -45,6 +46,7 @@ class SkillModule(nn.Module):
         else:
             z_q, _ = self.emb(z_e, weight_sg=True)
             emb, _ = self.emb(z_e.detach())
+            # reconstruction loss
             recon = self.skill_decoder(z_q).mean
 
             rec_loss = F.mse_loss(recon, emb_inputs)
@@ -152,6 +154,25 @@ class NearestEmbedEMA(nn.Module):
         self.register_buffer('embed_avg', embed.clone())
         self.register_buffer('prev_cluster', torch.zeros(n_emb))
 
+        '''
+        Forward pass for the VQ-VAE model.
+        Parameters:
+        -----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, emb_size, *).
+        *args : tuple
+            Additional positional arguments.
+        training : bool, optional
+            Flag indicating whether the model is in training mode (default is False).
+        **kwargs : dict
+            Additional keyword arguments.
+        Returns:
+        --------
+        result : torch.Tensor
+            Output tensor after vector quantization.
+        argmin : torch.Tensor
+            Indices of the nearest embeddings.
+        '''
     def forward(self, x, *args, training=False, **kwargs):
         """Input:
         ---------
@@ -201,7 +222,7 @@ class NearestEmbedEMA(nn.Module):
 
             embed_normalized = self.embed_avg / cluster_size.unsqueeze(0)
             self.weight.data.copy_(embed_normalized)
-
+        # 梯度不流向codebook，只流向输入
         result = x + (result - x).detach()
 
         return result, argmin

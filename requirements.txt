@@ -5,7 +5,7 @@ numpy
 probscale
 pygame
 pytest
-pyyaml==5.4.1
+pyyaml
 sacred
 scipy
 seaborn
@@ -16,4 +16,5 @@ tensorboardx
 torch
 torchaudio
 torchvision
-git+https://github.com/oxwhirl/smac.git
+pettingzoo
+gymnasium

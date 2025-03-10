@@ -169,7 +169,7 @@ def train_sequential(
     logger,
     learner,
     task2args,
-    task2runner,
+    task2runner, # This runner is only for test, so it uses online interaction
     task2offlinedata,
     t_start=0,
     pretrain=False,

@@ -61,7 +61,7 @@ epsilon: 0.9
 
 # planner params
 num_stack_frames: 1
-vq_skill: False
+vq_skill: True
 code_dim: 16
 
 # discriminator params

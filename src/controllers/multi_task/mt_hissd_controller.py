@@ -46,6 +46,7 @@ class HISSDSMAC:
             task_args.obs_shape = task_decomposer.obs_dim
 
         # build agents
+        # get input dimensions for each task, can choose to append action shape and id shape or not
         task2input_shape_info = self._get_input_shape()
         self._build_agents(task2input_shape_info)
 
@@ -154,13 +155,13 @@ class HISSDSMAC:
         actions=None,
         test_mode=False,
         training=False,
-        hrl=False,
+        hrl=False, # TODO:这个参数在训练VAE的时候一定要开启，不然每次都会进行skill的选择
         loss_out=False,
     ):
         if t % self.c_step == 0 or hrl == False:
             agent_inputs = self._build_inputs(ep_batch, t, task)
             next_inputs = None
-            if training:
+            if training: # 如果是训练模式，会用c_step后的预测作为重建损失
                 next_inputs = ep_batch["state"][:, t + self.c_step]
             out_h, self.hidden_states_plan, obs_loss = self.agent.forward_planner(
                 agent_inputs,
@@ -198,7 +199,9 @@ class HISSDSMAC:
         actions = ep_batch["actions"][:, t]
 
         bs = agent_inputs.shape[0] // self.task2n_agents[task]
-
+        # 看上去好像是有时间上抽象的? c_step个时间重新选一次skill
+        # 留出了接口，但是在默认配置里c_step = 1，即每一个时间步都选择一次skill. To be implement
+        # TODO:但是在agent的实现里，skill就是直接进行了一个赋值？那这个skill应该是不能用的
         if t % self.c_step == 0:
             (
                 agent_outs,

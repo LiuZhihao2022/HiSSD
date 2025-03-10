@@ -1,1 +1,4 @@
 *.pyc
+dataset
+.vscode
+results

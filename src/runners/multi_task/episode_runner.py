@@ -86,7 +86,7 @@ class EpisodeRunner:
                 task=self.task,
                 test_mode=test_mode,
             )
-
+            
             reward, terminated, env_info = self.env.step(actions[0])
             episode_return += reward
 

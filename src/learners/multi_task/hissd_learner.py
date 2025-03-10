@@ -154,7 +154,7 @@ class HISSDLearner:
     def reset_last_batch(self):
         self.last_task = ""
         self.last_batch = {}
-
+    # used for self-supervised learning
     def update_last_batch(self, cur_task, cur_batch):
         if not self.double_neg:
             if cur_task != self.last_task:
@@ -180,8 +180,8 @@ class HISSDLearner:
         )
 
         return target_outs
-
-    def train_vae(
+    
+    def train_vae(# TODO:目前VAE的重建以及技能选择都不是离散的. 若要更改为VQ-VAE，可能需要加入向量量化损失,承诺损失 (commitment loss),codebook使用分布损失
         self,
         batch: EpisodeBatch,
         t_env: int,
@@ -200,13 +200,13 @@ class HISSDLearner:
         b, t, n = actions.shape[0], actions.shape[1], actions.shape[2]
         self.mac.init_hidden(batch.batch_size, task)
         t = 0
-        while t < batch.max_seq_length - self.c:
-            act_outs = []
+        while t < batch.max_seq_length - self.c: # TODO:这里留出了接口，一次planner的技能选择可以指导c_time次底层动作选择. 是从skill重建动作，与原动作进行比对
+            act_outs = []   # forward_planner的作用是提取skill，计算技能表示，forward_planner_feedforward的作用是根据技能表示计算特定任务的特征(action or value)
             agent_outs, _ = self.mac.forward_planner(
                 batch, t=t, task=task, actions=actions[:, t], hrl=True
             )
             act_agent_outs = self.mac.forward_planner_feedforward(agent_outs)
-            for i in range(self.c):
+            for i in range(self.c):# 提取当前环境状态的关键特征,作为判别器，区分不同状态和任务的特征
                 _, discr_h = self.mac.forward_discriminator(batch, t=t + i, task=task)
                 act_out, _ = self.mac.forward_global_action(
                     batch, act_agent_outs, discr_h, t + i, task
@@ -214,7 +214,7 @@ class HISSDLearner:
                 act_outs.append(act_out)
             act_outs = th.stack(act_outs, dim=1)
             _, _, n, a = act_out.shape
-            dec_loss += (
+            dec_loss += ( # 动作重建损失：衡量预测动作与真实动作之间的差异. 这是VAE框架中的重建损失部分，目标是使解码后的动作尽可能接近真实执行的动作
                 F.cross_entropy(
                     act_outs.reshape(-1, a),
                     actions[:, t : t + self.c].squeeze(-1).reshape(-1),
@@ -224,8 +224,8 @@ class HISSDLearner:
             ) / n
             t += self.c
 
-        if (
-            len(self.last_batch) != 0
+        if (# TODO:不将ssl_type进行设置，就可以不加入contrastive loss进行任务区分；或者说，我的ssl_loss是为了学习多个skill-state在多个t后的状态表示而非任务区分，需要修改
+            len(self.last_batch) != 0   # TODO: 那如果要继续multi-task的配置，是否可以使用premier-TACO的表示学习方法?
             and self.ssl_type == "moco"
             and not self.main_args.adaptation
         ):
@@ -250,7 +250,7 @@ class HISSDLearner:
             total_target = th.cat(total_target, dim=0)
 
             for _ in range(cur_out.shape[0]):
-                ssl_loss += self.contrastive_loss(
+                ssl_loss += self.contrastive_loss(# TODO:这里是不是写错了？区分任务应该是和total_target做contrastive loss吧. 不过在我的实现中应该不需要这个损失
                     cur_out, pos_out.detach(), target_outs.detach()
                 )
             ssl_loss = ssl_loss / cur_out.shape[0]
@@ -354,7 +354,7 @@ class HISSDLearner:
         loss = vae_loss
 
         self.logger.log_stat(f"train/{task}/test_vae_loss", loss.item(), t_env)
-
+    # 使用value-based的方法训练MARL的值函数
     def train_value(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         # Get the relevant quantities
         rewards = batch["reward"][:, :]
@@ -412,7 +412,7 @@ class HISSDLearner:
             value_loss = th.mean((masked_td_error**2).sum()) / mask[:, : -self.c].sum()
         else:
             value_loss = (
-                th.mean(
+                th.mean( #Implicit Q-learning objective的不对称权重:当TD误差<0（高估）时，权重更接近1-self.epsilon;当TD误差>0（低估）时，权重更接近self.epsilon
                     th.abs(self.epsilon - (masked_td_error < 0).float()).mean()
                     * (masked_td_error**2).sum()
                 )
@@ -451,14 +451,14 @@ class HISSDLearner:
 
         self.mac.init_hidden(batch.batch_size, task)
         self.target_mac.init_hidden(batch.batch_size, task)
-        for t in range(batch.max_seq_length - self.c):
-            out_h, obs_loss = self.mac.forward_planner(
+        for t in range(batch.max_seq_length - self.c): # TODO: 这里也需要开启参数hrl=True?不然每个时间步都是在选择
+            out_h, obs_loss = self.mac.forward_planner( # 不用开，这里在训练模式，就是每个时间步都要选，为了最大化数据效率并且使技能生成可以在任意时间步
                 batch,
                 t=t,
                 task=task,
                 actions=actions[:, t],
                 training=True,
-                loss_out=True,
+                loss_out=True,  # 在训练模式中训练planner的时候才会根据loss回传
             )
             value_out_h = self.mac.forward_planner_feedforward(
                 out_h, forward_type="value"
@@ -476,8 +476,8 @@ class HISSDLearner:
             )
             mac_value.append(value_out_h)
 
-        #### value net inference
-        value_pre = []
+        #### value net inference   使用了前面的生成的skill，加上目前的state，来推断值函数，即论文里的local information
+        value_pre = []           # TODO:但是它的skill对于value推断出的不是next state，我需要自己添加WM来完成这一步
         target_value_pre = []
         for t in range(batch.max_seq_length):
             value = self.mac.forward_value(batch, t=t, task=task)
@@ -521,7 +521,7 @@ class HISSDLearner:
             td_error = (td_error * mask[:, : -self.c]).sum() / mask[:, : -self.c].sum()
             weight = th.exp(td_error * self.td_weight)
             weight = th.clamp_max(weight, 100.0).detach()
-            loss = weight * planner_loss
+            loss = weight * planner_loss # 论文里的equation 7，td-error与planner损失相乘
 
         self.mac.agent.value.requires_grad_(False)
         loss.backward()
