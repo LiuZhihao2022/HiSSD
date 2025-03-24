@@ -63,7 +63,7 @@ epsilon: 0.9
 num_stack_frames: 1
 vq_skill: True
 code_dim: 16
-
+reward_pred_weight: 1.0
 # discriminator params
 ssl_type: "moco"
 # ssl_type: "byol"

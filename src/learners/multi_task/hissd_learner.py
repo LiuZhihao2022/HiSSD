@@ -206,6 +206,19 @@ class HISSDLearner:
                 batch, t=t, task=task, actions=actions[:, t], hrl=True
             )
             act_agent_outs = self.mac.forward_planner_feedforward(agent_outs)
+            # 预测奖励 - 新增
+            # TODO: 这个要更改为reward的形状
+            reward_preds = self.mac.forward_planner_feedforward(agent_outs, forward_type="reward")
+            
+            # 计算实际累积奖励
+            actual_rewards = batch["reward"][:, t:t+self.c].sum(dim=1).unsqueeze(-1)
+            
+            # 奖励预测损失
+            reward_pred_loss += F.mse_loss(
+                reward_preds.view(-1, 1), 
+                actual_rewards.view(-1, 1),
+                reduction="sum"
+            ) / mask[:, t:t+self.c].sum()
             for i in range(self.c):# 提取当前环境状态的关键特征,作为判别器，区分不同状态和任务的特征
                 _, discr_h = self.mac.forward_discriminator(batch, t=t + i, task=task)
                 act_out, _ = self.mac.forward_global_action(
@@ -317,13 +330,15 @@ class HISSDLearner:
             ssl_loss = th.tensor(0.0)
         
         vae_loss = dec_loss / (batch.max_seq_length - self.c)
-        loss = vae_loss
+        reward_pred_loss = reward_pred_loss / (batch.max_seq_length - self.c)
+        # 添加奖励预测损失到总损失
+        loss = vae_loss + self.main_args.reward_pred_weight * reward_pred_loss
         if ssl_loss is not None:
             loss += self.beta * ssl_loss
 
         loss.backward()
 
-        return vae_loss, ssl_loss
+        return vae_loss, ssl_loss, reward_pred_loss
 
     def test_vae(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         rewards = batch["reward"][:, :]
@@ -437,6 +452,7 @@ class HISSDLearner:
         dec_loss=None,
         cls_loss=None,
         ssl_loss=None,
+        reward_pred_loss=None
     ):
         # Get the relevant quantities
         rewards = batch["reward"][:, :]
@@ -541,6 +557,7 @@ class HISSDLearner:
             self.logger.log_stat(f"{task}/value_loss", v_loss.item(), t_env)
             self.logger.log_stat(f"{task}/plan_loss", planner_loss.item(), t_env)
             self.logger.log_stat(f"{task}/ssl_loss", ssl_loss.item(), t_env)
+            self.logger.log_stat(f"{task}/reward_pred_loss", reward_pred_loss.item(), t_env)
 
     def train_ssl(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         # Get the relevant quantities
@@ -626,7 +643,7 @@ class HISSDLearner:
                 ssl_loss=th.tensor(0.0),
             )
         else:
-            dec_loss, ssl_loss = self.train_vae(batch, t_env, episode_num, task)
+            dec_loss, ssl_loss, reward_pred_loss = self.train_vae(batch, t_env, episode_num, task)
             self.update_last_batch(task, batch)
             self.update(pretrain=False)
             v_loss = self.train_value(batch, t_env, episode_num, task)
@@ -639,6 +656,7 @@ class HISSDLearner:
                 v_loss=v_loss,
                 dec_loss=dec_loss,
                 ssl_loss=ssl_loss,
+                reward_pred_loss=reward_pred_loss  # 添加奖励损失
             )
         self.training_steps += 1
 

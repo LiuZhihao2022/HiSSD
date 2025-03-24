@@ -600,9 +600,9 @@ class PlannerModel(nn.Module):
         self.value_enemy_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
         self.value_ally_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
 
-        self.dec_own_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
-        self.dec_enemy_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
-        self.dec_ally_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
+        self.rew_own_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
+        self.rew_enemy_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
+        self.rew_ally_forward = MLPNet(self.entity_embed_dim, self.entity_embed_dim, 128)
 
         self.n_actions_no_attack = n_actions_no_attack
         self.reset_last()
@@ -635,6 +635,10 @@ class PlannerModel(nn.Module):
             own_out = self.value_own_forward(own_emb)
             enemy_out = self.value_enemy_forward(enemy_emb)
             ally_out = self.value_ally_forward(ally_emb)
+        elif forward_type == 'reward':
+            own_out = self.rew_own_forward(own_emb)
+            enemy_out = self.rew_enemy_forward(enemy_emb)
+            ally_out = self.rew_ally_forward(ally_emb)
 
         return [own_out, enemy_out, ally_out]
 
