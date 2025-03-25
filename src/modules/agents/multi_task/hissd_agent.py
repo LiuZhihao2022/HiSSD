@@ -30,8 +30,11 @@ class HISSDAgent(nn.Module):
         self.encoder = Encoder(args)
         self.decoder = Decoder(task2input_shape_info, task2decomposer, task2n_agents, decomposer, args)
         self.planner = PlannerModel(task2input_shape_info, task2decomposer, task2n_agents, decomposer, args)
+        self.reward_transformer = Transformer(args.entity_embed_dim, args.head, args.depth, args.entity_embed_dim)
         self.discr = Discriminator(task2input_shape_info, task2decomposer, task2n_agents, decomposer, args)
-
+        self.reward_predict_net = nn.Sequential(nn.Linear(self.args.entity_embed_dim, 128),
+                                       nn.ReLU(inplace=True),
+                                       nn.Linear(128, 1))
         self.last_out_h = None
         self.last_h_plan = None
 
@@ -43,6 +46,7 @@ class HISSDAgent(nn.Module):
     def init_hidden(self):
         # make hidden states on the same device as model
         return (self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_(),
+                self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_(),
                 self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_(),
                 self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_(),
                 self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_())
@@ -105,6 +109,15 @@ class HISSDAgent(nn.Module):
         act, h_dec, _ = self.decoder(self.last_out_h, inputs, discr_h, hidden_state_dec, task, mask, actions)
 
         return act, self.last_h_plan, h_dec, h_dis, skill
+    # TODO:测试一下reward是否输出形状合适
+    def forward_reward_skill(self, inputs, hidden_state_reward, task):
+        total_hidden = th.cat(
+            [inputs, hidden_state_reward.reshape(-1, 1, self.args.entity_embed_dim)], dim=1)
+        outputs = self.reward_transformer(total_hidden, None)
+        h = outputs[:, -1:, :]
+        reward = outputs[:, 0, :]
+        reward = self.reward_predict_net(reward)
+        return reward, h
 
 
 class StateEncoder(nn.Module):
@@ -624,7 +637,7 @@ class PlannerModel(nn.Module):
         self.last_ally = ally
 
     def feedforward(self, inputs, forward_type='action'):
-        assert forward_type in ['action', 'value']
+        assert forward_type in ['action', 'value', 'reward']
         own_emb, enemy_emb, ally_emb = inputs
         n_enemy, n_ally = enemy_emb.shape[1], ally_emb.shape[1]
         if forward_type == 'action':
@@ -643,7 +656,7 @@ class PlannerModel(nn.Module):
         return [own_out, enemy_out, ally_out]
 
     def forward(self, inputs, hidden_state, t, task,
-                test=True, next_inputs=None, actions=None, loss_out=False):
+                test=True, next_inputs=None, actions=None, loss_out=False, return_pred=False):
         hidden_state = hidden_state.reshape(-1, 1, self.entity_embed_dim)
         # get decomposer, last_action_shape and n_agents of this specific task
         task_decomposer = self.task2decomposer[task]
@@ -675,8 +688,9 @@ class PlannerModel(nn.Module):
         attack_action_info = attack_action_info.transpose(0, 1).unsqueeze(-1)
         enemy_feats = th.cat([th.stack(enemy_feats, dim=0), attack_action_info], dim=-1)
         ally_feats = th.stack(ally_feats, dim=0)
-
+        # batch, n_enemy, n_feats
         enemy_feats = enemy_feats.permute(1, 0, 2)
+        # batch, n_ally, n_feats. 注意ally是比己方智能体数目少1的，因为还有一个是own
         ally_feats = ally_feats.permute(1, 0, 2)
         n_enemy, n_ally = enemy_feats.shape[1], ally_feats.shape[1]
 
@@ -708,12 +722,26 @@ class PlannerModel(nn.Module):
         own_out, enemy_out, ally_out = own_out_h, enemy_out_h, ally_out_h
 
         out_loss = th.tensor(0.).to(inputs.device)
-        if loss_out and next_inputs is not None:
-            out_loss = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
-                                       t=t, actions=actions)
-            out_loss += commit_loss
-        # TODO:out_loss也就是外面的obs_loss，是rec_loss和commit_loss的和。我需要加上reward model作为奖励预测的loss
-        return [own_out_h, enemy_out_h, ally_out_h], h, out_loss
+        pred_states = None
+        
+        if next_inputs is not None:
+            if loss_out and return_pred:
+                out_loss, pred_states = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
+                                                t=t, actions=actions, return_pred=True)
+                out_loss += commit_loss
+            elif loss_out:
+                out_loss = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
+                                    t=t, actions=actions, return_pred=False)
+                out_loss += commit_loss
+            elif return_pred:
+                # 只预测状态但不计算损失
+                _, pred_states = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
+                                        t=t, actions=actions, return_pred=True)
+        
+        if return_pred:
+            return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, pred_states
+        else:
+            return [own_out_h, enemy_out_h, ally_out_h], h, out_loss
 
 
 class Discriminator(nn.Module):
@@ -991,7 +1019,7 @@ class MergeRec(nn.Module):
 
         return attn_out
 
-    def forward(self, emb_inputs, states, task, t=0, actions=None):
+    def forward(self, emb_inputs, states, task, t=0, actions=None, return_pred=False):
         own_emb, enemy_emb, ally_emb = emb_inputs
         ally_states, enemy_states = self.global_process(states, task, actions=actions)
         bs, n_agents, n_enemies = ally_states.shape[0], ally_states.shape[1], enemy_states.shape[1]
@@ -1021,9 +1049,22 @@ class MergeRec(nn.Module):
         self.last_enemy_h = enemy_out
 
         al_dim, en_dim = ally_states.shape[-1], enemy_states.shape[-1]
-        ally_out = self.ally_dec_fc(ally_out).reshape(-1, al_dim)
-        enemy_out = self.enemy_dec_fc(enemy_out).reshape(-1, en_dim)
+        ally_pred = self.ally_dec_fc(ally_out).reshape(-1, al_dim)
+        enemy_pred = self.enemy_dec_fc(enemy_out).reshape(-1, en_dim)
 
-        loss = F.mse_loss(ally_out, ally_states.reshape(-1, al_dim).detach()) + \
-            F.mse_loss(enemy_out, enemy_states.reshape(-1, en_dim).detach())
+        loss = F.mse_loss(ally_pred, ally_states.reshape(-1, al_dim).detach()) + \
+            F.mse_loss(enemy_pred, enemy_states.reshape(-1, en_dim).detach())
+        
+        if return_pred:
+            # 重构预测的状态
+            predicted_ally = ally_pred.reshape(bs, n_agents, al_dim)
+            predicted_enemy = enemy_pred.reshape(bs, n_enemies, en_dim)
+            
+            # 构建预测状态字典
+            predicted_states = {
+                "ally_states": predicted_ally,
+                "enemy_states": predicted_enemy
+            }
+            return loss, predicted_states
+        
         return loss

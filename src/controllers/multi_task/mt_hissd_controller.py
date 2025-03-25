@@ -56,6 +56,7 @@ class HISSDSMAC:
 
     def init_params(self):
         self.hidden_states_value = None
+        self.hidden_states_reward = None
         self.hidden_states_enc = None
         self.hidden_states_dec = None
         self.hidden_states_plan = None
@@ -147,6 +148,15 @@ class HISSDSMAC:
             ep_batch.batch_size, self.c_step, self.task2n_agents[task], -1
         )
 
+    def forward_reward_skill(self, ep_batch, batch_emb, task):
+        batch_emb = th.cat(batch_emb, dim=1)
+        agent_outs, self.hidden_states_reward = self.agent.forward_reward_skill(
+            batch_emb, self.hidden_states_reward, task
+        )
+        # dim of reward predicted is [bs, 1]
+        agent_outs = agent_outs.reshape(ep_batch.batch_size, self.task2n_agents[task], 1).sum(dim = 1)
+        return agent_outs
+
     def forward_planner(
         self,
         ep_batch,
@@ -157,23 +167,47 @@ class HISSDSMAC:
         training=False,
         hrl=False, # TODO:这个参数在训练VAE的时候一定要开启，不然每次都会进行skill的选择
         loss_out=False,
+        return_pred=False, # 新增参数，控制是否返回预测状态
     ):
         if t % self.c_step == 0 or hrl == False:
+            # agent_inputs -> (bs*n_agents, input_shape)
             agent_inputs = self._build_inputs(ep_batch, t, task)
             next_inputs = None
-            if training: # 如果是训练模式，会用c_step后的预测作为重建损失
-                next_inputs = ep_batch["state"][:, t + self.c_step]
-            out_h, self.hidden_states_plan, obs_loss = self.agent.forward_planner(
-                agent_inputs,
-                self.hidden_states_plan,
-                t,
-                task,
-                actions=actions,
-                next_inputs=next_inputs,
-                loss_out=loss_out,
-            )
-            self.last_out_h, self.last_obs_loss = out_h, obs_loss
+            if training or return_pred:  # 训练模式或需要预测状态时获取next_inputs
+                if t + self.c_step < ep_batch["state"].shape[1]:  # 确保不会越界
+                    next_inputs = ep_batch["state"][:, t + self.c_step]
+                
+            if return_pred and next_inputs is not None:
+                # 如果需要预测状态且有下一步状态可用
+                out_h, self.hidden_states_plan, obs_loss, pred_states = self.agent.forward_planner(
+                    agent_inputs,
+                    self.hidden_states_plan,
+                    t,
+                    task,
+                    actions=actions,
+                    next_inputs=next_inputs,
+                    loss_out=loss_out,
+                    return_pred=True
+                )
+                # 即返回预测的skill, loss, pred_states
+                self.last_out_h, self.last_obs_loss = out_h, obs_loss
+                return self.last_out_h, self.last_obs_loss, pred_states
+            else:
+                # 常规forward调用
+                out_h, self.hidden_states_plan, obs_loss = self.agent.forward_planner(
+                    agent_inputs,
+                    self.hidden_states_plan,
+                    t,
+                    task,
+                    actions=actions,
+                    next_inputs=next_inputs,
+                    loss_out=loss_out
+                )
+                self.last_out_h, self.last_obs_loss = out_h, obs_loss
 
+        if return_pred:
+            # 如果需要预测但无法获取（可能因为t+c_step超出范围或不是预测时机）
+            return self.last_out_h, self.last_obs_loss, None
         return self.last_out_h, self.last_obs_loss
 
     def forward_planner_feedforward(self, emb_inputs, forward_type="action"):
@@ -279,11 +313,19 @@ class HISSDSMAC:
         n_agents = self.task2n_agents[task]
         (
             hidden_states_value,
+            hidden_states_reward,
             hidden_states_dec,
             hidden_states_plan,
             hidden_states_dis,
         ) = self.agent.init_hidden()
         self.hidden_states_value = hidden_states_value.unsqueeze(0).expand(
+            batch_size, n_agents, -1
+        )
+        # because shape of input of reward is [batch_size * n_agents, entity_dim], not [batch_size, n_agents, entity_dim]
+        # self.hidden_states_reward = hidden_states_reward.expand(
+        #     batch_size, -1
+        # )
+        self.hidden_states_reward = hidden_states_reward.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
         self.hidden_states_dec = hidden_states_dec.unsqueeze(0).expand(
@@ -295,6 +337,7 @@ class HISSDSMAC:
         self.hidden_states_dis = hidden_states_dis.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
+
 
     def parameters(self):
         return self.agent.parameters()
@@ -334,6 +377,19 @@ class HISSDSMAC:
         return actions
 
     def _build_inputs(self, batch, t, task):
+        """
+        Builds the input tensor for the agents at a given time step.
+        Args:
+            batch (Batch): The batch of data containing observations, actions, etc.
+            t (int): The current time step.
+            task (str): The task identifier.
+        Returns:
+            Tensor: The input tensor for the agents at the given time step.
+        Notes:
+            - Assumes homogenous agents with flat observations.
+            - If `obs_last_action` is True in task arguments, includes the last action taken by the agents.
+            - If `obs_agent_id` is True in task arguments, includes the agent IDs as a one-hot encoded tensor.
+        """
         # Assumes homogenous agents with flat observations.
         # Other MACs might want to e.g. delegate building inputs to each agent
         bs = batch.batch_size

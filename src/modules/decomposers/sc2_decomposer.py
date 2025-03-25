@@ -167,19 +167,22 @@ class SC2Decomposer:
         env_obs = [move_feats, enemy_feats, ally_feats, own_feats]
         """
         
-        # extract move feats
+        # 提取移动特征
         move_feats = obs_input[:, :self.move_feats]
-        # extract enemy_feats
+        
+        # 提取敌人特征
         base = self.move_feats
         enemy_feats = [obs_input[:, base + i * self.obs_nf_en:base + (i + 1) * self.obs_nf_en] for i in range(self.n_enemies)]
-        # extract ally_feats
+        
+        # 提取盟友特征
         base += self.obs_nf_en * self.n_enemies
         ally_feats = [obs_input[:, base + i * self.obs_nf_al:base + (i + 1) * self.obs_nf_al] for i in range(self.n_agents - 1)]
-        # extract own feats
+        
+        # 提取自身特征
         base += self.obs_nf_al * (self.n_agents - 1)
         own_feats = obs_input[:, base:base + self.own_feats]
-      
-        # own
+    
+        # 组合自身特征和移动特征
         own_obs = th.cat([move_feats, own_feats], dim=-1)
         
         return own_obs, enemy_feats, ally_feats

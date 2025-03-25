@@ -206,19 +206,7 @@ class HISSDLearner:
                 batch, t=t, task=task, actions=actions[:, t], hrl=True
             )
             act_agent_outs = self.mac.forward_planner_feedforward(agent_outs)
-            # 预测奖励 - 新增
-            # TODO: 这个要更改为reward的形状
-            reward_preds = self.mac.forward_planner_feedforward(agent_outs, forward_type="reward")
             
-            # 计算实际累积奖励
-            actual_rewards = batch["reward"][:, t:t+self.c].sum(dim=1).unsqueeze(-1)
-            
-            # 奖励预测损失
-            reward_pred_loss += F.mse_loss(
-                reward_preds.view(-1, 1), 
-                actual_rewards.view(-1, 1),
-                reduction="sum"
-            ) / mask[:, t:t+self.c].sum()
             for i in range(self.c):# 提取当前环境状态的关键特征,作为判别器，区分不同状态和任务的特征
                 _, discr_h = self.mac.forward_discriminator(batch, t=t + i, task=task)
                 act_out, _ = self.mac.forward_global_action(
@@ -330,15 +318,14 @@ class HISSDLearner:
             ssl_loss = th.tensor(0.0)
         
         vae_loss = dec_loss / (batch.max_seq_length - self.c)
-        reward_pred_loss = reward_pred_loss / (batch.max_seq_length - self.c)
-        # 添加奖励预测损失到总损失
-        loss = vae_loss + self.main_args.reward_pred_weight * reward_pred_loss
+        # 移除了奖励预测部分，现在在train_planner中进行
+        loss = vae_loss
         if ssl_loss is not None:
             loss += self.beta * ssl_loss
 
         loss.backward()
 
-        return vae_loss, ssl_loss, reward_pred_loss
+        return vae_loss, ssl_loss
 
     def test_vae(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         rewards = batch["reward"][:, :]
@@ -452,7 +439,6 @@ class HISSDLearner:
         dec_loss=None,
         cls_loss=None,
         ssl_loss=None,
-        reward_pred_loss=None
     ):
         # Get the relevant quantities
         rewards = batch["reward"][:, :]
@@ -462,24 +448,34 @@ class HISSDLearner:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
 
         mac_value = []
+        mac_reward = []
         planner_loss = 0.0
+        reward_pred_loss = 0.0  # 添加奖励预测损失
         b, t, n = actions.shape[0], actions.shape[1], actions.shape[2]
 
         self.mac.init_hidden(batch.batch_size, task)
         self.target_mac.init_hidden(batch.batch_size, task)
-        for t in range(batch.max_seq_length - self.c): # TODO: 这里也需要开启参数hrl=True?不然每个时间步都是在选择
-            out_h, obs_loss = self.mac.forward_planner( # 不用开，这里在训练模式，就是每个时间步都要选，为了最大化数据效率并且使技能生成可以在任意时间步
+        for t in range(batch.max_seq_length - self.c):
+            out_h, obs_loss = self.mac.forward_planner(
                 batch,
                 t=t,
                 task=task,
                 actions=actions[:, t],
                 training=True,
-                loss_out=True,  # 在训练模式中训练planner的时候才会根据loss回传
+                loss_out=True,
             )
+            # 预测值函数
             value_out_h = self.mac.forward_planner_feedforward(
                 out_h, forward_type="value"
             )
             mac_value.append(value_out_h)
+            
+            # 添加奖励预测部分
+            reward_out_h = self.mac.forward_planner_feedforward(
+                out_h, forward_type="reward"
+            )
+            mac_reward.append(reward_out_h)
+            # 获取实际奖励            
             planner_loss += obs_loss
 
         t = batch.max_seq_length - self.c
@@ -490,21 +486,30 @@ class HISSDLearner:
             value_out_h = self.mac.forward_planner_feedforward(
                 out_h, forward_type="value"
             )
+            reward_out_h = self.mac.forward_planner_feedforward(
+                out_h, forward_type="reward"
+            )
+            mac_reward.append(reward_out_h)
             mac_value.append(value_out_h)
 
         #### value net inference   使用了前面的生成的skill，加上目前的state，来推断值函数，即论文里的local information
         value_pre = []           # TODO:但是它的skill对于value推断出的不是next state，我需要自己添加WM来完成这一步
         target_value_pre = []
+        reward_pre = []
         for t in range(batch.max_seq_length):
             value = self.mac.forward_value(batch, t=t, task=task)
+            reward_pred = self.mac.forward_reward_skill(batch, mac_reward[t], task=task)
             with th.no_grad():
                 target_value = self.target_mac.forward_value_skill(
                     batch, mac_value[t], task=task
                 )
             value_pre.append(value)
+            reward_pre.append(reward_pred)
             target_value_pre.append(target_value)
 
         value_pre = th.stack(value_pre, dim=1)
+        # TODO:check dim
+        reward_pre = th.stack(reward_pre, dim=1)
         target_value_pre = th.stack(target_value_pre, dim=1)
 
         if self.mixer is not None:
@@ -534,10 +539,16 @@ class HISSDLearner:
             )
             planner_loss = planner_loss / (batch.max_seq_length - self.c)
             mask = mask.expand_as(mixed_values)
+            reward_pred_loss += F.mse_loss(
+                reward_pre[:, :-self.c].reshape(-1, 1), 
+                cs_rewards[:, :-self.c].reshape(-1, 1),
+                reduction="sum"
+            ) / mask[:, : -self.c].sum()
             td_error = (td_error * mask[:, : -self.c]).sum() / mask[:, : -self.c].sum()
             weight = th.exp(td_error * self.td_weight)
             weight = th.clamp_max(weight, 100.0).detach()
-            loss = weight * planner_loss # 论文里的equation 7，td-error与planner损失相乘
+            # 论文里的equation 7，td-error与planner损失相乘
+            loss = weight * planner_loss + self.main_args.reward_pred_weight * reward_pred_loss
 
         self.mac.agent.value.requires_grad_(False)
         loss.backward()
@@ -643,11 +654,15 @@ class HISSDLearner:
                 ssl_loss=th.tensor(0.0),
             )
         else:
-            dec_loss, ssl_loss, reward_pred_loss = self.train_vae(batch, t_env, episode_num, task)
-            self.update_last_batch(task, batch)
-            self.update(pretrain=False)
-            v_loss = self.train_value(batch, t_env, episode_num, task)
-            self.update(pretrain=False)
+            dec_loss = 0
+            ssl_loss = 0
+            v_loss = 0
+            # dec_loss, ssl_loss, reward_pred_loss = self.train_vae(batch, t_env, episode_num, task)
+            # self.update_last_batch(task, batch)
+            # self.update(pretrain=False)
+            # v_loss = self.train_value(batch, t_env, episode_num, task)
+            # self.update(pretrain=False)
+
             self.train_planner(
                 batch,
                 t_env,
@@ -656,7 +671,6 @@ class HISSDLearner:
                 v_loss=v_loss,
                 dec_loss=dec_loss,
                 ssl_loss=ssl_loss,
-                reward_pred_loss=reward_pred_loss  # 添加奖励损失
             )
         self.training_steps += 1
 
