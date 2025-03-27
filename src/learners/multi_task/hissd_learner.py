@@ -202,8 +202,8 @@ class HISSDLearner:
         t = 0
         while t < batch.max_seq_length - self.c: # TODO:这里留出了接口，一次planner的技能选择可以指导c_time次底层动作选择. 是从skill重建动作，与原动作进行比对
             act_outs = []   # forward_planner的作用是提取skill，计算技能表示，forward_planner_feedforward的作用是根据技能表示计算特定任务的特征(action or value)
-            agent_outs, _ = self.mac.forward_planner(
-                batch, t=t, task=task, actions=actions[:, t], hrl=True
+            agent_outs, _, _, _ = self.mac.forward_planner(
+                batch, t=t, task=task, actions=actions[:, t], hrl=True, skill_index_out=False
             )
             act_agent_outs = self.mac.forward_planner_feedforward(agent_outs)
             
@@ -456,7 +456,7 @@ class HISSDLearner:
         self.mac.init_hidden(batch.batch_size, task)
         self.target_mac.init_hidden(batch.batch_size, task)
         for t in range(batch.max_seq_length - self.c):
-            out_h, obs_loss = self.mac.forward_planner(
+            out_h, obs_loss, _, _ = self.mac.forward_planner(
                 batch,
                 t=t,
                 task=task,
@@ -480,7 +480,7 @@ class HISSDLearner:
 
         t = batch.max_seq_length - self.c
         for i in range(self.c):
-            out_h, _ = self.mac.forward_planner(
+            out_h, _, _, _ = self.mac.forward_planner(
                 batch, t=t + i, task=task, actions=actions[:, t + i]
             )
             value_out_h = self.mac.forward_planner_feedforward(
@@ -497,6 +497,9 @@ class HISSDLearner:
         target_value_pre = []
         reward_pre = []
         for t in range(batch.max_seq_length):
+            # target_value是使用skill结合计算出的（结合论文里equation 7的local information），但是当前timestep的value是没有使用skill计算的（论文里单纯用obs）。这是为什么？
+            # value是用每个agent的obs计算的，然后通过mix network结合在一起，而target_value是用skill计算的，然后通过mix network结合在一起
+            # 这个是最主要的value计算函数。forward_skill_value只是为了引导skill条件下的value，在最后test过程中应该是不用的
             value = self.mac.forward_value(batch, t=t, task=task)
             reward_pred = self.mac.forward_reward_skill(batch, mac_reward[t], task=task)
             with th.no_grad():

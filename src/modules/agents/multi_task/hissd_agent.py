@@ -81,10 +81,20 @@ class HISSDAgent(nn.Module):
         return attn_out, hidden_state_value
 
     def forward_planner(self, inputs, hidden_state_plan, t, task,
-                        actions=None, next_inputs=None, loss_out=False):
-        out_h, h, obs_loss = self.planner(inputs, hidden_state_plan, t, task,
-                                          next_inputs=next_inputs, actions=actions, loss_out=loss_out)
-        return out_h, h, obs_loss
+                        actions=None, next_inputs=None, loss_out=False, skill_index_out=False, return_pred=False):
+        # 始终获取所有可能的返回值
+        out_h, h, obs_loss, skill_index, pred_states = self.planner(inputs, hidden_state_plan, t, task,
+                                          next_inputs=next_inputs, actions=actions, loss_out=loss_out, 
+                                          skill_index_out=skill_index_out, return_pred=return_pred)
+        
+        # 根据参数设置返回值，但始终返回相同数量的结果
+        if not skill_index_out:
+            skill_index = None
+            
+        if not return_pred:
+            pred_states = None
+            
+        return out_h, h, obs_loss, skill_index, pred_states
 
     def forward_planner_feedforward(self, emb_inputs, forward_type='action'):
         out_h = self.planner.feedforward(emb_inputs, forward_type)
@@ -99,16 +109,24 @@ class HISSDAgent(nn.Module):
         return logits
 
     def forward(self, inputs, hidden_state_plan, hidden_state_dec, hidden_state_dis, t, task, skill,
-                mask=False, actions=None, local_obs=None, test_mode=None):
+                mask=False, actions=None, local_obs=None, test_mode=None, skill_index_out=False):
+        # TODO: 这里要进行修改，将skill在forward函数中得到并传出到外面。并且只有在t%c=0的时候才计算skill
         if t % self.c == 0:
-            out_h, h_plan, _ = self.forward_planner(inputs, hidden_state_plan, t, task)
+            # h_plan是hidden_state_plan
+            if skill_index_out == False:
+                out_h, h_plan, _ = self.forward_planner(inputs, hidden_state_plan, t, task)
+            else:
+                out_h, h_plan, _, skill_index = self.forward_planner(inputs, hidden_state_plan, t, task, skill_index_out=True)
             out_h = self.forward_planner_feedforward(out_h)
+            # TODO: 将skill维护在动作选择里面，就不用在外面显示保存skill了。我是要将这一步skill的选择替换为MCTS
             self.last_out_h, self.last_h_plan = out_h, h_plan
         _, discr_h, h_dis = self.forward_discriminator(inputs, t, task, hidden_state_dis)
         discr_h  = discr_h.reshape(-1, 1, self.args.entity_embed_dim)
         act, h_dec, _ = self.decoder(self.last_out_h, inputs, discr_h, hidden_state_dec, task, mask, actions)
-
-        return act, self.last_h_plan, h_dec, h_dis, skill
+        if skill_index_out == False:
+            return act, self.last_h_plan, h_dec, h_dis
+        else:
+            return act, self.last_h_plan, h_dec, h_dis, skill_index
     # TODO:测试一下reward是否输出形状合适
     def forward_reward_skill(self, inputs, hidden_state_reward, task):
         total_hidden = th.cat(
@@ -654,9 +672,10 @@ class PlannerModel(nn.Module):
             ally_out = self.rew_ally_forward(ally_emb)
 
         return [own_out, enemy_out, ally_out]
-
+    # inputs就是obs+last_action+agent_id
+    # next_inputs在原文中就是states，没有更改过。这里rec_module做的应该是根据skill和obs去重建未来的states
     def forward(self, inputs, hidden_state, t, task,
-                test=True, next_inputs=None, actions=None, loss_out=False, return_pred=False):
+                test=True, next_inputs=None, actions=None, loss_out=False, skill_index_out=False, return_pred=False):
         hidden_state = hidden_state.reshape(-1, 1, self.entity_embed_dim)
         # get decomposer, last_action_shape and n_agents of this specific task
         task_decomposer = self.task2decomposer[task]
@@ -714,6 +733,8 @@ class PlannerModel(nn.Module):
         commit_loss = th.tensor(0.).to(inputs.device)
         if self.vq_skill:
             outputs, skill_index, commit_loss = self.skill_module(outputs)
+        else:
+            skill_index = None  # 非VQ模式时返回None
 
         own_out_h = outputs[:, -1, 0].unsqueeze(1)
         enemy_out_h = outputs[:, -1, 1:1+n_enemy]
@@ -722,7 +743,7 @@ class PlannerModel(nn.Module):
         own_out, enemy_out, ally_out = own_out_h, enemy_out_h, ally_out_h
 
         out_loss = th.tensor(0.).to(inputs.device)
-        pred_states = None
+        pred_states = None  # 默认为None
         
         if next_inputs is not None:
             if loss_out and return_pred:
@@ -738,10 +759,8 @@ class PlannerModel(nn.Module):
                 _, pred_states = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
                                         t=t, actions=actions, return_pred=True)
         
-        if return_pred:
-            return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, pred_states
-        else:
-            return [own_out_h, enemy_out_h, ally_out_h], h, out_loss
+        # 始终返回5个值，保持一致性
+        return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, skill_index, pred_states
 
 
 class Discriminator(nn.Module):

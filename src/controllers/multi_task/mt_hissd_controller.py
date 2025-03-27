@@ -66,6 +66,8 @@ class HISSDSMAC:
         self.cls_dim = 3
         self.last_out_h = None
         self.last_obs_loss = None
+        self.last_skill_index = None  # 添加新属性
+        self.last_pred_states = None  # 添加新属性
 
     def select_actions(
         self, ep_batch, t_ep, t_env, task, bs=slice(None), test_mode=False
@@ -85,7 +87,7 @@ class HISSDSMAC:
         )
 
         return agent_outs.reshape(ep_batch.batch_size * self.task2n_agents[task], 1, -1)
-
+    # 这个obs_emb应该是skill，名字有误导
     def forward_global_action(
         self, ep_batch, obs_emb, disrc_h, t, task, test_model=False
     ):
@@ -168,6 +170,7 @@ class HISSDSMAC:
         hrl=False, # TODO:这个参数在训练VAE的时候一定要开启，不然每次都会进行skill的选择
         loss_out=False,
         return_pred=False, # 新增参数，控制是否返回预测状态
+        skill_index_out=False, # 新增参数，控制是否返回skill_index
     ):
         if t % self.c_step == 0 or hrl == False:
             # agent_inputs -> (bs*n_agents, input_shape)
@@ -177,38 +180,26 @@ class HISSDSMAC:
                 if t + self.c_step < ep_batch["state"].shape[1]:  # 确保不会越界
                     next_inputs = ep_batch["state"][:, t + self.c_step]
                 
-            if return_pred and next_inputs is not None:
-                # 如果需要预测状态且有下一步状态可用
-                out_h, self.hidden_states_plan, obs_loss, pred_states = self.agent.forward_planner(
-                    agent_inputs,
-                    self.hidden_states_plan,
-                    t,
-                    task,
-                    actions=actions,
-                    next_inputs=next_inputs,
-                    loss_out=loss_out,
-                    return_pred=True
-                )
-                # 即返回预测的skill, loss, pred_states
-                self.last_out_h, self.last_obs_loss = out_h, obs_loss
-                return self.last_out_h, self.last_obs_loss, pred_states
-            else:
-                # 常规forward调用
-                out_h, self.hidden_states_plan, obs_loss = self.agent.forward_planner(
-                    agent_inputs,
-                    self.hidden_states_plan,
-                    t,
-                    task,
-                    actions=actions,
-                    next_inputs=next_inputs,
-                    loss_out=loss_out
-                )
-                self.last_out_h, self.last_obs_loss = out_h, obs_loss
+            # 统一调用方式，始终获取所有返回值
+            out_h, self.hidden_states_plan, obs_loss, skill_index, pred_states = self.agent.forward_planner(
+                agent_inputs,
+                self.hidden_states_plan,
+                t,
+                task,
+                actions=actions,
+                next_inputs=next_inputs,
+                loss_out=loss_out,
+                return_pred=return_pred,
+                skill_index_out=skill_index_out
+            )
+            
+            # 保存所有返回结果
+            self.last_out_h, self.last_obs_loss = out_h, obs_loss
+            self.last_skill_index = skill_index
+            self.last_pred_states = pred_states
 
-        if return_pred:
-            # 如果需要预测但无法获取（可能因为t+c_step超出范围或不是预测时机）
-            return self.last_out_h, self.last_obs_loss, None
-        return self.last_out_h, self.last_obs_loss
+        # 始终返回相同数量的值，但根据参数确定具体内容
+        return self.last_out_h, self.last_obs_loss, self.last_skill_index, self.last_pred_states
 
     def forward_planner_feedforward(self, emb_inputs, forward_type="action"):
         out_h = self.agent.forward_planner_feedforward(emb_inputs, forward_type)
