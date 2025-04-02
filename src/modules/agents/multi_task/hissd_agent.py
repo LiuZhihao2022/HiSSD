@@ -80,6 +80,7 @@ class HISSDAgent(nn.Module):
         attn_out, hidden_state_value = self.value.predict(total_hidden)
         return attn_out, hidden_state_value
 
+    # TODO: 放到gumble-muzero中时就要看这里，是否
     def forward_planner(self, inputs, hidden_state_plan, t, task,
                         actions=None, next_inputs=None, loss_out=False, skill_index_out=False, return_pred=False):
         # 始终获取所有可能的返回值
@@ -113,10 +114,8 @@ class HISSDAgent(nn.Module):
         # TODO: 这里要进行修改，将skill在forward函数中得到并传出到外面。并且只有在t%c=0的时候才计算skill
         if t % self.c == 0:
             # h_plan是hidden_state_plan
-            if skill_index_out == False:
-                out_h, h_plan, _ = self.forward_planner(inputs, hidden_state_plan, t, task)
-            else:
-                out_h, h_plan, _, skill_index = self.forward_planner(inputs, hidden_state_plan, t, task, skill_index_out=True)
+            out_h, h_plan, _, skill_index = self.forward_planner(inputs, hidden_state_plan, t, task, skill_index_out)
+            # 上一行是得到skill的表示，这一行是将skill融合得到真正的action code。在下面通过decoder解码成单独的action
             out_h = self.forward_planner_feedforward(out_h)
             # TODO: 将skill维护在动作选择里面，就不用在外面显示保存skill了。我是要将这一步skill的选择替换为MCTS
             self.last_out_h, self.last_h_plan = out_h, h_plan
@@ -689,6 +688,7 @@ class PlannerModel(nn.Module):
         inputs[:, obs_dim + last_action_shape:]
 
         # decompose observation input
+        # enemy_feats是一个list，长度为enemy_num, 包含了所有敌方智能体的特征，ally_feats也是一个list，包含了所有友方智能体的特征
         own_obs, enemy_feats, ally_feats = task_decomposer.decompose_obs(
             obs_inputs)  # own_obs: [bs*self.n_agents, own_obs_dim]
         bs = int(own_obs.shape[0] / task_n_agents)
@@ -705,6 +705,7 @@ class PlannerModel(nn.Module):
 
         # incorporate attack_action_info into enemy_feats
         attack_action_info = attack_action_info.transpose(0, 1).unsqueeze(-1)
+        # e.g.,原来enemy_feats为list，长度为enemy_num, 每一个元素为[bs * n_agents, obs_en_dim]，现在cat后就变成了[enemy_num, bs * n_agents, obs_en_dim+1]了
         enemy_feats = th.cat([th.stack(enemy_feats, dim=0), attack_action_info], dim=-1)
         ally_feats = th.stack(ally_feats, dim=0)
         # batch, n_enemy, n_feats
@@ -987,6 +988,10 @@ class MergeRec(nn.Module):
         else:
             self.ally_dec_fc = MLPNet(self.entity_embed_dim, state_nf_al + (self.n_actions_no_attack + 1), 128)
             self.enemy_dec_fc = MLPNet(self.entity_embed_dim, state_nf_en + 1, 128)
+            
+        # 添加新的观察预测网络
+        self.obs_pred = MLPNet(self.entity_embed_dim + decomposer.n_enemies * self.entity_embed_dim, 
+                               decomposer.obs_dim, 128)
 
     def global_process(self, states, task, actions=None):
         states = states.unsqueeze(1)
@@ -1038,13 +1043,18 @@ class MergeRec(nn.Module):
 
         return attn_out
 
-    def forward(self, emb_inputs, states, task, t=0, actions=None, return_pred=False):
+    def forward(self, emb_inputs, obs, task, t=0, actions=None, return_pred=False):
         own_emb, enemy_emb, ally_emb = emb_inputs
-        ally_states, enemy_states = self.global_process(states, task, actions=actions)
-        bs, n_agents, n_enemies = ally_states.shape[0], ally_states.shape[1], enemy_states.shape[1]
+        task_decomposer = self.task2decomposer[task]
+        task_n_agents = self.task2n_agents[task]
+        n_agents = task_decomposer.n_agents
+        n_enemies = task_decomposer.n_enemies
+        
+        bs = own_emb.shape[0] // n_agents  # 计算批次大小
+        
         if t==0:
             self.last_enemy_h = self.enemy_hidden.repeat(bs, n_enemies, 1).unsqueeze(-2)
-
+        # 为什么不使用ally, 是因为own_emb和ally_emb是重合的！ally不就是每一个own的组合吗
         own_emb = own_emb.reshape(bs, n_agents, self.entity_embed_dim)
         enemy_emb = enemy_emb.reshape(bs, n_agents, n_enemies, self.entity_embed_dim).permute(
             0, 2, 1, 3).reshape(-1, n_agents, self.entity_embed_dim)
@@ -1063,26 +1073,35 @@ class MergeRec(nn.Module):
         total_k = th.cat([own_k, enemy_k], dim=-2)
         total_out = self.attn_process(total_emb, total_q, total_k)
 
-        ally_out = total_out[:, :n_agents]
-        enemy_out = total_out[:, -n_enemies:]
+        ally_out = total_out[:, :n_agents]  # [bs, n_agents, entity_embed_dim]
+        enemy_out = total_out[:, -n_enemies:]  # [bs, n_enemies, entity_embed_dim]
         self.last_enemy_h = enemy_out
 
-        al_dim, en_dim = ally_states.shape[-1], enemy_states.shape[-1]
-        ally_pred = self.ally_dec_fc(ally_out).reshape(-1, al_dim)
-        enemy_pred = self.enemy_dec_fc(enemy_out).reshape(-1, en_dim)
-
-        loss = F.mse_loss(ally_pred, ally_states.reshape(-1, al_dim).detach()) + \
-            F.mse_loss(enemy_pred, enemy_states.reshape(-1, en_dim).detach())
+        # 根据要求拼接 ally_out 和 enemy_out：每个 ally 附加所有 enemy 的特征
+        # 将 enemy_out 扩展为 [bs, 1, n_enemies, entity_embed_dim]
+        enemy_out_expanded = enemy_out.unsqueeze(1)
+        
+        # 广播并展平为 [bs, n_agents, n_enemies * entity_embed_dim]
+        enemy_out_flat = enemy_out_expanded.expand(bs, n_agents, n_enemies, self.entity_embed_dim).reshape(
+            bs, n_agents, n_enemies * self.entity_embed_dim)
+        
+        # 拼接 ally_out 和展平后的 enemy_out
+        agent_out = th.cat([ally_out, enemy_out_flat], dim=-1)  # [bs, n_agents, entity_embed_dim + n_enemies * entity_embed_dim]
+        
+        # 使用 obs_pred 网络预测观察值
+        # TODO: 最后一步，怎么把obs_pred的输入大小和输出大小固定住？转向single_task？这个结束之后，设计一个world model的函数（与该函数大部分类似其实，就是不计算loss，就可以了）
+        obs_pred_out = self.obs_pred(agent_out).reshape(-1, task_decomposer.obs_dim)
+        
+        # 计算预测观察值与真实观察值之间的损失
+        loss = F.mse_loss(obs_pred_out, obs.reshape(-1, task_decomposer.obs_dim).detach())
         
         if return_pred:
-            # 重构预测的状态
-            predicted_ally = ally_pred.reshape(bs, n_agents, al_dim)
-            predicted_enemy = enemy_pred.reshape(bs, n_enemies, en_dim)
+            # 构建预测观察字典
+            predicted_obs = obs_pred_out.reshape(bs * n_agents, task_decomposer.obs_dim)
             
             # 构建预测状态字典
             predicted_states = {
-                "ally_states": predicted_ally,
-                "enemy_states": predicted_enemy
+                "obs": predicted_obs
             }
             return loss, predicted_states
         

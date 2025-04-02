@@ -17,7 +17,7 @@ class SkillModule(nn.Module):
         self.vq_ema = vq_ema
         self.skill_dim = args.skill_dim
         self.code_dim = args.code_dim
-
+        # TODO:为什么这个系数取这么小？是因为skill的重建本身就要求loss很小吗？不过这个也不会影响其他模块的训练就是了
         self.comit_coef = 1e-4
         self.vq_coef = 0.05
         self.skill_encoder = MLPNet(self.entity_embed_dim, self.code_dim, 128)

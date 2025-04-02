@@ -177,8 +177,10 @@ class HISSDSMAC:
             agent_inputs = self._build_inputs(ep_batch, t, task)
             next_inputs = None
             if training or return_pred:  # 训练模式或需要预测状态时获取next_inputs
-                if t + self.c_step < ep_batch["state"].shape[1]:  # 确保不会越界
-                    next_inputs = ep_batch["state"][:, t + self.c_step]
+                # if t + self.c_step < ep_batch["state"].shape[1]:  # 确保不会越界
+                #     next_inputs = ep_batch["state"][:, t + self.c_step]
+                if t + self.c_step < ep_batch["obs"].shape[1]:  # 确保不会越界
+                    next_inputs = ep_batch["obs"][:, t + self.c_step]
                 
             # 统一调用方式，始终获取所有返回值
             out_h, self.hidden_states_plan, obs_loss, skill_index, pred_states = self.agent.forward_planner(

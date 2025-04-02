@@ -165,7 +165,9 @@ class SC2Decomposer:
         """
         obs_input: env_obs + last_action + agent_id
         env_obs = [move_feats, enemy_feats, ally_feats, own_feats]
+        每个智能体的obs都包含这几部分：move_feats, enemy_feats, ally_feats, own_feats。其中move_feats是智能体的移动特征，这里就是将不同的特征区分开来
         """
+        
         
         # 提取移动特征
         move_feats = obs_input[:, :self.move_feats]
@@ -189,7 +191,31 @@ class SC2Decomposer:
 
     def decompose_action_info(self, action_info):
         """
-        action_info: shape [n_agent, n_action]
+        Decomposes the action information into three components: no-attack actions, 
+        attack actions, and a compact representation of the action information.
+
+        Args:
+            action_info (torch.Tensor): A tensor of shape [n_agent, n_action] or 
+                higher dimensions, representing the action information for agents.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - no_attack_action_info: A tensor containing the no-attack action 
+                  information, reshaped to match the original dimensions except 
+                  for the last axis, which is of size `n_actions_no_attack`.
+                - attack_action_info: A tensor containing the attack action 
+                  information, reshaped to match the original dimensions except 
+                  for the last axis, which is of size `n_enemies`.
+                - compact_action_info: A tensor containing a compact representation 
+                  of the action information, where the attack actions are 
+                  represented as a binary indicator (summed along the attack 
+                  dimension and unsqueezed) concatenated with the no-attack actions.
+
+        Notes:
+            - The method assumes that the input `action_info` has at least two 
+              dimensions, where the last dimension corresponds to the action space.
+            - The `n_actions_no_attack` and `n_enemies` attributes must be defined 
+              in the class instance for this method to function correctly.
         """
         shape = action_info.shape
         if len(shape) > 2:
