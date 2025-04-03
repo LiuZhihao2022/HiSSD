@@ -66,8 +66,8 @@ class HISSDSMAC:
         self.cls_dim = 3
         self.last_out_h = None
         self.last_obs_loss = None
-        self.last_skill_index = None  # 添加新属性
-        self.last_pred_states = None  # 添加新属性
+        self.last_skill_index = None
+        self.last_pred_states = None
 
     def select_actions(
         self, ep_batch, t_ep, t_env, task, bs=slice(None), test_mode=False
@@ -118,13 +118,13 @@ class HISSDSMAC:
 
         return agent_outs.reshape(bs, self.task2n_agents[task], 1)
 
-    def forward_value_skill(self, ep_batch, batch_emb, task):
+    def forward_value_skill(self, bs, batch_emb, task):
         batch_emb = th.cat(batch_emb, dim=1)
         agent_outs, self.hidden_states_value = self.agent.forward_value_skill(
             batch_emb, self.hidden_states_value, task
         )
 
-        return agent_outs.reshape(ep_batch.batch_size, self.task2n_agents[task], 1)
+        return agent_outs.reshape(bs, self.task2n_agents[task], 1)
 
     def forward_seq_action(self, ep_batch, t, task, mask=False, test_model=False):
         agent_seq_inputs = []
@@ -150,13 +150,13 @@ class HISSDSMAC:
             ep_batch.batch_size, self.c_step, self.task2n_agents[task], -1
         )
 
-    def forward_reward_skill(self, ep_batch, batch_emb, task):
+    def forward_reward_skill(self, bs, batch_emb, task):
         batch_emb = th.cat(batch_emb, dim=1)
         agent_outs, self.hidden_states_reward = self.agent.forward_reward_skill(
             batch_emb, self.hidden_states_reward, task
         )
         # dim of reward predicted is [bs, 1]
-        agent_outs = agent_outs.reshape(ep_batch.batch_size, self.task2n_agents[task], 1).sum(dim = 1)
+        agent_outs = agent_outs.reshape(bs, self.task2n_agents[task], 1).sum(dim = 1)
         return agent_outs
 
     def forward_planner(
@@ -169,21 +169,19 @@ class HISSDSMAC:
         training=False,
         hrl=False, # TODO:这个参数在训练VAE的时候一定要开启，不然每次都会进行skill的选择
         loss_out=False,
-        return_pred=False, # 新增参数，控制是否返回预测状态
-        skill_index_out=False, # 新增参数，控制是否返回skill_index
+        skill_index_out=False, # 参数，控制是否返回skill_index
     ):
+        # 移除了return_pred参数及相关逻辑
         if t % self.c_step == 0 or hrl == False:
             # agent_inputs -> (bs*n_agents, input_shape)
             agent_inputs = self._build_inputs(ep_batch, t, task)
             next_inputs = None
-            if training or return_pred:  # 训练模式或需要预测状态时获取next_inputs
-                # if t + self.c_step < ep_batch["state"].shape[1]:  # 确保不会越界
-                #     next_inputs = ep_batch["state"][:, t + self.c_step]
+            if training:  # 只在训练模式下获取next_inputs用于计算损失
                 if t + self.c_step < ep_batch["obs"].shape[1]:  # 确保不会越界
                     next_inputs = ep_batch["obs"][:, t + self.c_step]
                 
-            # 统一调用方式，始终获取所有返回值
-            out_h, self.hidden_states_plan, obs_loss, skill_index, pred_states = self.agent.forward_planner(
+            # 修改调用方式
+            out_h, self.hidden_states_plan, obs_loss, skill_index = self.agent.forward_planner(
                 agent_inputs,
                 self.hidden_states_plan,
                 t,
@@ -191,17 +189,14 @@ class HISSDSMAC:
                 actions=actions,
                 next_inputs=next_inputs,
                 loss_out=loss_out,
-                return_pred=return_pred,
                 skill_index_out=skill_index_out
             )
             
-            # 保存所有返回结果
+            # 保存结果
             self.last_out_h, self.last_obs_loss = out_h, obs_loss
             self.last_skill_index = skill_index
-            self.last_pred_states = pred_states
 
-        # 始终返回相同数量的值，但根据参数确定具体内容
-        return self.last_out_h, self.last_obs_loss, self.last_skill_index, self.last_pred_states
+        return self.last_out_h, self.last_obs_loss, self.last_skill_index
 
     def forward_planner_feedforward(self, emb_inputs, forward_type="action"):
         out_h = self.agent.forward_planner_feedforward(emb_inputs, forward_type)
@@ -314,10 +309,6 @@ class HISSDSMAC:
         self.hidden_states_value = hidden_states_value.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
-        # because shape of input of reward is [batch_size * n_agents, entity_dim], not [batch_size, n_agents, entity_dim]
-        # self.hidden_states_reward = hidden_states_reward.expand(
-        #     batch_size, -1
-        # )
         self.hidden_states_reward = hidden_states_reward.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
@@ -330,7 +321,13 @@ class HISSDSMAC:
         self.hidden_states_dis = hidden_states_dis.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
-
+    def init_hidden_wm(self, batch_size, task):
+        n_agents = self.task2n_agents[task]
+        hidden_state_wm = self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_()
+        hidden_state_wm = hidden_state_wm.unsqueeze(0).expand(
+            batch_size, n_agents, -1
+        )
+        return hidden_state_wm
 
     def parameters(self):
         return self.agent.parameters()
@@ -383,12 +380,9 @@ class HISSDSMAC:
             - If `obs_last_action` is True in task arguments, includes the last action taken by the agents.
             - If `obs_agent_id` is True in task arguments, includes the agent IDs as a one-hot encoded tensor.
         """
-        # Assumes homogenous agents with flat observations.
-        # Other MACs might want to e.g. delegate building inputs to each agent
         bs = batch.batch_size
         inputs = []
         inputs.append(batch["obs"][:, t])
-        # get args, n_agents for this specific task
         task_args, n_agents = self.task2args[task], self.task2n_agents[task]
         if task_args.obs_last_action:
             if t == 0:
@@ -421,3 +415,81 @@ class HISSDSMAC:
                 "agent_id_shape": agent_id_shape,
             }
         return task2input_shape_info
+
+    def get_codebook(self):
+        """返回agent中planner的skill模块的codebook"""
+        return self.agent.get_codebook()
+
+    def get_total_agents(self, task):
+        """返回特定任务的总agent数目（ally + enemy）"""
+        return self.agent.get_total_agents(task)
+
+    def world_model_predict(self, batch_obs, batch_last_action, skill_index, hidden_state_wm, task):
+        # 获取当前的obs，是使用build过后的inputs去重建obs的
+        # 这个batch应该是一个包含batch_size的，但是到mctx里面怎么batch地使用？
+        hidden_state_reward = hidden_state_wm
+        bs = batch_obs.shape[0]
+        inputs = []
+        inputs.append(batch_obs)
+        task_args, n_agents = self.task2args[task], self.task2n_agents[task]
+        task_decomposer = self.task2decomposer[task]
+        n_enemy = task_decomposer.n_enemies
+        n_ally = n_agents - 1
+        n_actions = task_args.n_actions
+        if task_args.obs_last_action:
+            if batch_last_action == None:
+                inputs.append(th.zeros(bs, n_agents, n_actions, device=batch_obs.device))
+            else:
+                inputs.append(batch_last_action)
+        if task_args.obs_agent_id:
+            inputs.append(
+                th.eye(n_agents, device=batch_obs.device).unsqueeze(0).expand(bs, -1, -1)
+            )
+        # TODO: check shape here
+        agent_inputs = th.cat([x.reshape(bs * n_agents, -1) for x in inputs], dim=1)
+        
+        # 获取codebook
+        codebook = self.get_codebook()
+        if codebook is None or skill_index is None:
+            raise ValueError("无法获取codebook或skill_index无效")
+        
+        # 使用skill_index获取对应的code
+        device = agent_inputs.device
+    
+        if isinstance(skill_index, th.Tensor):
+            skill_code = codebook[skill_index]
+        else:
+            skill_code = codebook[th.tensor(skill_index, device=device)]
+        # TODO:这个skill应该是什么shape?
+        own_skill = skill_code[:, 0].unsqueeze(1)
+        enemy_skill = skill_code[:, 1:1+n_enemy]
+        ally_skill = skill_code[:, 1+n_enemy:1+n_enemy+n_ally]
+        all_skill = [own_skill, enemy_skill, ally_skill]
+        with th.no_grad():
+            # 使用skill_code修改embedding
+            # 这里假设skill_code可以直接用于out_h的计算
+            
+            # 使用MergeRec的pred_next_obs方法预测下一步观察
+            
+            # 预测下一步观察
+            next_obs = self.agent.planner.rec_module.pred_next_obs(
+                all_skill, task,
+            )
+            next_obs = next_obs.reshape(bs, n_agents, task_decomposer.obs_dim)
+            next_state = next_obs.view(bs, -1)
+            
+            # 使用HISSDAgent的forward_reward_skill预测奖励
+            # 为reward预测准备输入
+            # TODO: reward的预测是怎样预测的?输入输出要的skill是怎样的形式?
+            reward_out_h = self.mac.forward_planner_feedforward(
+                all_skill, forward_type="reward"
+            )
+            batch_emb_reward = th.cat(reward_out_h, dim=1)
+            # emb_to_reward = modified_out_h[0].reshape(bs, n_agents, -1)
+            reward_pred, hidden_state_reward = self.agent.forward_reward_skill(
+                batch_emb_reward, hidden_state_reward, task
+            )
+
+            # update hidden state
+            hidden_state_wm = hidden_state_reward
+            return next_obs, reward_pred, hidden_state_wm

@@ -82,20 +82,17 @@ class HISSDAgent(nn.Module):
 
     # TODO: 放到gumble-muzero中时就要看这里，是否
     def forward_planner(self, inputs, hidden_state_plan, t, task,
-                        actions=None, next_inputs=None, loss_out=False, skill_index_out=False, return_pred=False):
+                        actions=None, next_inputs=None, loss_out=False, skill_index_out=False):
         # 始终获取所有可能的返回值
-        out_h, h, obs_loss, skill_index, pred_states = self.planner(inputs, hidden_state_plan, t, task,
+        out_h, h, obs_loss, skill_index = self.planner(inputs, hidden_state_plan, t, task,
                                           next_inputs=next_inputs, actions=actions, loss_out=loss_out, 
-                                          skill_index_out=skill_index_out, return_pred=return_pred)
+                                          skill_index_out=skill_index_out)
         
-        # 根据参数设置返回值，但始终返回相同数量的结果
+        # 根据参数设置返回值
         if not skill_index_out:
             skill_index = None
             
-        if not return_pred:
-            pred_states = None
-            
-        return out_h, h, obs_loss, skill_index, pred_states
+        return out_h, h, obs_loss, skill_index
 
     def forward_planner_feedforward(self, emb_inputs, forward_type='action'):
         out_h = self.planner.feedforward(emb_inputs, forward_type)
@@ -127,14 +124,28 @@ class HISSDAgent(nn.Module):
         else:
             return act, self.last_h_plan, h_dec, h_dis, skill_index
     # TODO:测试一下reward是否输出形状合适
-    def forward_reward_skill(self, inputs, hidden_state_reward, task):
+    def forward_reward_skill(self, inputs, hidden_state_reward, task=None):
         total_hidden = th.cat(
             [inputs, hidden_state_reward.reshape(-1, 1, self.args.entity_embed_dim)], dim=1)
         outputs = self.reward_transformer(total_hidden, None)
         h = outputs[:, -1:, :]
+        # 0 应该是代表own。1:enemy是enemy的，1+enemy+ally是ally的
         reward = outputs[:, 0, :]
         reward = self.reward_predict_net(reward)
         return reward, h
+
+    def get_codebook(self):
+        """返回agent中planner的skill模块的codebook"""
+        if hasattr(self.planner, 'skill_module') and hasattr(self.planner.skill_module, 'emb'):
+            return self.planner.skill_module.emb.weight
+        return None
+
+    def get_total_agents(self, task):
+        """返回特定任务的总agent数目（ally + enemy）"""
+        if task in self.task2decomposer:
+            task_decomposer = self.task2decomposer[task]
+            return task_decomposer.n_agents + task_decomposer.n_enemies
+        return 0
 
 
 class StateEncoder(nn.Module):
@@ -674,7 +685,7 @@ class PlannerModel(nn.Module):
     # inputs就是obs+last_action+agent_id
     # next_inputs在原文中就是states，没有更改过。这里rec_module做的应该是根据skill和obs去重建未来的states
     def forward(self, inputs, hidden_state, t, task,
-                test=True, next_inputs=None, actions=None, loss_out=False, skill_index_out=False, return_pred=False):
+                test=True, next_inputs=None, actions=None, loss_out=False, skill_index_out=False):
         hidden_state = hidden_state.reshape(-1, 1, self.entity_embed_dim)
         # get decomposer, last_action_shape and n_agents of this specific task
         task_decomposer = self.task2decomposer[task]
@@ -744,24 +755,13 @@ class PlannerModel(nn.Module):
         own_out, enemy_out, ally_out = own_out_h, enemy_out_h, ally_out_h
 
         out_loss = th.tensor(0.).to(inputs.device)
-        pred_states = None  # 默认为None
         
-        if next_inputs is not None:
-            if loss_out and return_pred:
-                out_loss, pred_states = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
-                                                t=t, actions=actions, return_pred=True)
-                out_loss += commit_loss
-            elif loss_out:
-                out_loss = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
-                                    t=t, actions=actions, return_pred=False)
-                out_loss += commit_loss
-            elif return_pred:
-                # 只预测状态但不计算损失
-                _, pred_states = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
-                                        t=t, actions=actions, return_pred=True)
+        if next_inputs is not None and loss_out:
+            out_loss = self.rec_module([own_out, enemy_out, ally_out], next_inputs, task,
+                                t=t, actions=actions)
+            out_loss += commit_loss
         
-        # 始终返回5个值，保持一致性
-        return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, skill_index, pred_states
+        return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, skill_index
 
 
 class Discriminator(nn.Module):
@@ -1042,8 +1042,7 @@ class MergeRec(nn.Module):
         attn_out = attn_out.reshape(bs, n, self.entity_embed_dim)
 
         return attn_out
-
-    def forward(self, emb_inputs, obs, task, t=0, actions=None, return_pred=False):
+    def pred_next_obs(self, emb_inputs, task, t=0, actions=None):
         own_emb, enemy_emb, ally_emb = emb_inputs
         task_decomposer = self.task2decomposer[task]
         task_n_agents = self.task2n_agents[task]
@@ -1091,18 +1090,10 @@ class MergeRec(nn.Module):
         # 使用 obs_pred 网络预测观察值
         # TODO: 最后一步，怎么把obs_pred的输入大小和输出大小固定住？转向single_task？这个结束之后，设计一个world model的函数（与该函数大部分类似其实，就是不计算loss，就可以了）
         obs_pred_out = self.obs_pred(agent_out).reshape(-1, task_decomposer.obs_dim)
-        
+        return obs_pred_out
+    def forward(self, emb_inputs, obs, task, t=0, actions=None):
+        obs_pred_out = self.pred_next_obs(emb_inputs, task, t=t, actions=actions)
+        task_decomposer = self.task2decomposer[task]
         # 计算预测观察值与真实观察值之间的损失
         loss = F.mse_loss(obs_pred_out, obs.reshape(-1, task_decomposer.obs_dim).detach())
-        
-        if return_pred:
-            # 构建预测观察字典
-            predicted_obs = obs_pred_out.reshape(bs * n_agents, task_decomposer.obs_dim)
-            
-            # 构建预测状态字典
-            predicted_states = {
-                "obs": predicted_obs
-            }
-            return loss, predicted_states
-        
         return loss
