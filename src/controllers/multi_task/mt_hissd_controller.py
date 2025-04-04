@@ -321,12 +321,43 @@ class HISSDSMAC:
         self.hidden_states_dis = hidden_states_dis.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
+    # 不仅是initialize world model,还是forward action with skill 的 latent
+    # TODO: 应该两个初始化的时机都是一样的，区别是wm latent需要存在tree buffer里，action的不用，存在self里即可
     def init_hidden_wm(self, batch_size, task):
+        """
+        Initializes the hidden states for the world model (WM) of the agents 
+        for a specific task.
+
+        Args:
+            batch_size (int): The number of samples in the batch.
+            task (str): The task identifier used to determine the number of agents.
+
+        Returns:
+            list: A list containing the initialized hidden states for reward and value 
+                  networks, each with dimensions expanded to match the batch size 
+                  and number of agents.
+        """
         n_agents = self.task2n_agents[task]
-        hidden_state_wm = self.encoder.q_skill.weight.new(1, self.args.entity_embed_dim).zero_()
-        hidden_state_wm = hidden_state_wm.unsqueeze(0).expand(
+        (
+            hidden_states_value,
+            hidden_states_reward,
+            hidden_states_dec_for_act,
+            hidden_states_plan,
+            hidden_states_dis_for_act,
+        ) = self.agent.init_hidden()
+        hidden_states_value = hidden_states_value.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
+        hidden_states_reward = hidden_states_reward.unsqueeze(0).expand(
+            batch_size, n_agents, -1
+        )
+        self.hidden_states_dec_for_act = hidden_states_dec_for_act.unsqueeze(0).expand(
+            batch_size, n_agents, -1
+        )
+        self.hidden_states_dis_for_act = hidden_states_dis_for_act.unsqueeze(0).expand(
+            batch_size, n_agents, -1
+        )
+        hidden_state_wm = [hidden_states_reward, hidden_states_value]
         return hidden_state_wm
 
     def parameters(self):
@@ -415,7 +446,79 @@ class HISSDSMAC:
                 "agent_id_shape": agent_id_shape,
             }
         return task2input_shape_info
+    
+    # 这个函数还是需要smac的框架，因为要做online的交互，不过要把ma-gumbel-muzero给引进来
+    def forward_action_skill(self, ep_batch, t, skill_index, task, test_mode=False):
+        agent_inputs = self._build_inputs(ep_batch, t, task)
+        avail_actions = ep_batch["avail_actions"][:, t]
+        actions = ep_batch["actions"][:, t]
+        # 获取codebook
+        codebook = self.get_codebook()
+        if codebook is None or skill_index is None:
+            raise ValueError("无法获取codebook或skill_index无效")
+        
+        # 使用skill_index获取对应的code
+        device = agent_inputs.device
+    
+        if isinstance(skill_index, th.Tensor):
+            skill_code = codebook[skill_index]
+        else:
+            skill_code = codebook[th.tensor(skill_index, device=device)]
+        
+        task_args, n_agents = self.task2args[task], self.task2n_agents[task]
+        task_decomposer = self.task2decomposer[task]
+        n_enemy = task_decomposer.n_enemies
+        n_ally = n_agents - 1
+        own_skill = skill_code[:, 0].unsqueeze(1)
+        enemy_skill = skill_code[:, 1:1+n_enemy]
+        ally_skill = skill_code[:, 1+n_enemy:1+n_enemy+n_ally]
+        all_skill = [own_skill, enemy_skill, ally_skill]
+        action_out_h = self.forward_planner_feedforward(
+            all_skill, forward_type="action")
+        
+        (
+            agent_outs,
+            self.hidden_states_dec_for_act,
+            self.hidden_states_dis_for_act,
+        ) = self.agent(
+            agent_inputs,
+            self.hidden_states_dec_for_act,
+            self.hidden_states_dis_for_act,
+            t,
+            task,
+            action_out_h, # 这个就是skill, 专门为action的
+        )
+        if self.agent_output_type == "pi_logits":
 
+            if getattr(self.main_args, "mask_before_softmax", True):
+                # Make the logits for unavailable actions very negative to minimise their affect on the softmax
+                reshaped_avail_actions = avail_actions.reshape(
+                    ep_batch.batch_size * self.task2n_agents[task], -1
+                )
+                agent_outs[reshaped_avail_actions == 0] = -1e10
+
+            agent_outs = th.nn.functional.softmax(agent_outs, dim=-1)
+
+            if not test_mode and self.main_args.adaptation:
+                # Epsilon floor
+                epsilon_action_num = agent_outs.size(-1)
+                if getattr(self.main_args, "mask_before_softmax", True):
+                    # With probability epsilon, we will pick an available action uniformly
+                    epsilon_action_num = reshaped_avail_actions.sum(
+                        dim=1, keepdim=True
+                    ).float()
+
+                agent_outs = (
+                    1 - self.action_selector.epsilon
+                ) * agent_outs + th.ones_like(
+                    agent_outs
+                ) * self.action_selector.epsilon / epsilon_action_num
+
+                if getattr(self.main_args, "mask_before_softmax", True):
+                    # Zero out the unavailable actions
+                    agent_outs[reshaped_avail_actions == 0] = 0.0
+
+        return agent_outs.view(ep_batch.batch_size, self.task2n_agents[task], -1)
     def get_codebook(self):
         """返回agent中planner的skill模块的codebook"""
         return self.agent.get_codebook()
@@ -424,10 +527,11 @@ class HISSDSMAC:
         """返回特定任务的总agent数目（ally + enemy）"""
         return self.agent.get_total_agents(task)
 
+    # 这个函数接口应该契合ma-gumbel-muzero的设计
     def world_model_predict(self, batch_obs, batch_last_action, skill_index, hidden_state_wm, task):
         # 获取当前的obs，是使用build过后的inputs去重建obs的
         # 这个batch应该是一个包含batch_size的，但是到mctx里面怎么batch地使用？
-        hidden_state_reward = hidden_state_wm
+        hidden_state_reward, hidden_state_value = hidden_state_wm
         bs = batch_obs.shape[0]
         inputs = []
         inputs.append(batch_obs)
@@ -480,16 +584,26 @@ class HISSDSMAC:
             
             # 使用HISSDAgent的forward_reward_skill预测奖励
             # 为reward预测准备输入
-            # TODO: reward的预测是怎样预测的?输入输出要的skill是怎样的形式?
-            reward_out_h = self.mac.forward_planner_feedforward(
+            reward_out_h = self.forward_planner_feedforward(
                 all_skill, forward_type="reward"
             )
             batch_emb_reward = th.cat(reward_out_h, dim=1)
-            # emb_to_reward = modified_out_h[0].reshape(bs, n_agents, -1)
             reward_pred, hidden_state_reward = self.agent.forward_reward_skill(
                 batch_emb_reward, hidden_state_reward, task
             )
+            
+            # 新增: 使用HISSDAgent的forward_value_skill预测价值
+            # 为value预测准备输入
+            # TODO: value的预测是使用这个函数还是forward_value函数？
+            
+            value_out_h = self.forward_planner_feedforward(
+                all_skill, forward_type="value"
+            )
+            batch_emb_value = th.cat(value_out_h, dim=1)
+            value_pred, hidden_state_value = self.agent.forward_value_skill(
+                batch_emb_value, hidden_state_value, task
+            )
 
             # update hidden state
-            hidden_state_wm = hidden_state_reward
-            return next_obs, reward_pred, hidden_state_wm
+            hidden_state_wm = [hidden_state_reward, hidden_state_value]
+            return next_obs, next_state, reward_pred, value_pred, hidden_state_wm

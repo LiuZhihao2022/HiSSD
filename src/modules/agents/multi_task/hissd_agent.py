@@ -123,6 +123,14 @@ class HISSDAgent(nn.Module):
             return act, self.last_h_plan, h_dec, h_dis
         else:
             return act, self.last_h_plan, h_dec, h_dis, skill_index
+    def forward_action_skill(self, inputs, hidden_state_dec, hidden_state_dis, t, task, skill, 
+                                 mask=False, actions=None):
+        # 这个参数t其实没用上，在forward_discriminator里没有使用
+        _, discr_h, h_dis = self.forward_discriminator(inputs, t, task, hidden_state_dis)
+        discr_h  = discr_h.reshape(-1, 1, self.args.entity_embed_dim)
+        act, h_dec, _ = self.decoder(skill, inputs, discr_h, hidden_state_dec, task, mask, actions)
+        return act, h_dec, h_dis
+    
     # TODO:测试一下reward是否输出形状合适
     def forward_reward_skill(self, inputs, hidden_state_reward, task=None):
         total_hidden = th.cat(
