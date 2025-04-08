@@ -18,7 +18,7 @@ mixing_embed_dim: 32
 hypernet_layers: 2
 hypernet_embed: 64
 
-name: "mto"
+name: "mcts"
 
 # agent type
 agent: "mt_hissd"
@@ -30,9 +30,9 @@ optim_type: "AdamW" # Optimizer type
 # params about trans mixing network
 entity_embed_dim: 64
 attn_embed_dim: 8
-skill_dim: 64
+# skill_dim: 64
+skill_dim: 16
 task: 3
-c_step: 1
 # beta: 0.001
 beta: 0.05
 coef_conservative: 5.0
@@ -65,8 +65,9 @@ vq_skill: True
 code_dim: 16
 reward_pred_weight: 1.0
 # discriminator params
-ssl_type: "moco"
+# ssl_type: "moco"
 # ssl_type: "byol"
+ssl_type: null # 没有使用ssl
 ssl_time_window: 4
 
 double_neg: True
@@ -74,4 +75,20 @@ double_neg: True
 noise_weight: 0.
 adaptation: False
 debug: False
+
+# -----------------------hier-mcts params-----------------------
+batch_size: 1 # specially for episode runner
+c_step: 5
+use_online_mcts: True
+online_steps: 2000500
+# 可以存放多少条数据，不过这个是要和buffer每次采样的size相关的
+replay_buffer_list_capacity: 2000
+target_update_interval: 200
+num_simulations: 32
+max_num_considered_actions: 16
+use_mixed_value: False
 obs_process_dim: 16
+k: 16
+temprature: 1.0
+value_loss_weight: 0.5
+max_grad_norm: 10.0

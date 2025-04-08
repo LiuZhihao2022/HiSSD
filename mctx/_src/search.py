@@ -248,7 +248,7 @@ def expand(
   chex.assert_shape(step.discount, [batch_size])
   chex.assert_shape(step.value, [batch_size])
   tree = update_tree_node(
-      tree, next_node_index, step.prior_logits, step.value, next_embedding, next_observation, step.policy_hidden_states, step.critic_hidden_states, step.sampled_actions)
+      tree, next_node_index, step.prior_logits, step.value, next_embedding, next_observation, step.policy_hidden_states, step.critic_hidden_states, step.wm_hidden_states, step.sampled_actions)
 
   return tree.replace(
       children_index=batch_update(
@@ -351,6 +351,7 @@ def update_tree_node(
     observations: np.ndarray,
     new_policy_hidden_states: np.ndarray,
     new_critic_hidden_states: np.ndarray,
+    new_wm_hidden_states: np.ndarray,
     sampled_actions: np.ndarray) -> Tree[T]:
   """Updates the tree at node index."""
   batch_size = tree_lib.infer_batch_size(tree)
@@ -374,6 +375,7 @@ def update_tree_node(
           tree.observations, observations),
       policy_hidden_states=batch_update(tree.policy_hidden_states, new_policy_hidden_states, node_index),
       critic_hidden_states=batch_update(tree.critic_hidden_states, new_critic_hidden_states, node_index),
+      wm_hidden_states=batch_update(tree.wm_hidden_states, new_wm_hidden_states, node_index),
       sampled_actions=batch_update(tree.sampled_actions, sampled_actions, node_index)
   )
 
@@ -420,10 +422,12 @@ def instantiate_tree_from_root(
       # 最后一个维度才和agent的数目有关
       sampled_actions=np.zeros((batch_size, num_nodes, num_actions, num_agents), dtype=np.int32),
       policy_hidden_states=np.zeros((batch_size, num_nodes, num_agents, root.new_policy_hidden_states.shape[-1]), dtype=np.float32),
-      critic_hidden_states=np.zeros((batch_size, num_nodes, root.new_critic_hidden_states.shape[-1]), dtype=np.float32)
+      critic_hidden_states=np.zeros((batch_size, num_nodes, root.new_critic_hidden_states.shape[-1]), dtype=np.float32),
+      # 这里的wm_hidden_states包含两项，reward和value，所以有一个2
+      wm_hidden_states=np.zeros((batch_size, num_nodes, 2, num_agents, root.new_wm_hidden_states.shape[-1]), dtype=np.float32),
   )
 
   root_index = np.full([batch_size], Tree.ROOT_INDEX)
   tree = update_tree_node(
-      tree, root_index, root.prior_logits, root.value, root.embedding, root.observation, root.new_policy_hidden_states, root.new_critic_hidden_states, root.sampled_actions)
+      tree, root_index, root.prior_logits, root.value, root.embedding, root.observation, root.new_policy_hidden_states, root.new_critic_hidden_states, root.new_wm_hidden_states, root.sampled_actions)
   return tree

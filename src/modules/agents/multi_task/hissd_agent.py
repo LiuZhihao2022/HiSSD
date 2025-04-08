@@ -24,7 +24,7 @@ class HISSDAgent(nn.Module):
 
         self.c = args.c_step
         self.skill_dim = args.skill_dim
-
+        self.entity_embed_dim = args.entity_embed_dim
         self.q = Qnet(args)
         self.value = ValueNet(task2input_shape_info, task2decomposer, task2n_agents, decomposer, args)
         self.encoder = Encoder(args)
@@ -37,6 +37,17 @@ class HISSDAgent(nn.Module):
                                        nn.Linear(128, 1))
         self.last_out_h = None
         self.last_h_plan = None
+
+        obs_own_dim = decomposer.own_obs_dim
+        obs_en_dim, obs_al_dim = decomposer.obs_nf_en, decomposer.obs_nf_al
+        obs_en_dim += 1
+        n_actions_no_attack = decomposer.n_actions_no_attack
+        ## get wrapped obs_own_dim
+        wrapped_obs_own_dim = obs_own_dim + args.id_length + n_actions_no_attack + 1
+        self.ally_process = nn.Linear(obs_al_dim, args.entity_embed_dim)
+        self.enemy_process = nn.Linear(obs_en_dim, args.entity_embed_dim)
+        self.own_process = nn.Linear(wrapped_obs_own_dim, args.entity_embed_dim)
+        self.transformer_process = Transformer(args.entity_embed_dim, args.head, args.depth, args.entity_embed_dim)
 
         self.coordination = []
         self.specific = []
@@ -120,7 +131,7 @@ class HISSDAgent(nn.Module):
         discr_h  = discr_h.reshape(-1, 1, self.args.entity_embed_dim)
         act, h_dec, _ = self.decoder(self.last_out_h, inputs, discr_h, hidden_state_dec, task, mask, actions)
         if skill_index_out == False:
-            return act, self.last_h_plan, h_dec, h_dis
+            return act, self.last_h_plan, h_dec, h_dis, None
         else:
             return act, self.last_h_plan, h_dec, h_dis, skill_index
     def forward_action_skill(self, inputs, hidden_state_dec, hidden_state_dis, t, task, skill, 
@@ -147,13 +158,80 @@ class HISSDAgent(nn.Module):
         if hasattr(self.planner, 'skill_module') and hasattr(self.planner.skill_module, 'emb'):
             return self.planner.skill_module.emb.weight
         return None
-
+    def get_skill(self, skill_index):
+        """返回agent中planner的skill模块的skill"""
+        if hasattr(self.planner, 'skill_module') and hasattr(self.planner.skill_module, 'emb'):
+            return self.planner.skill_module.emb.weight[:, skill_index]
+        return None
     def get_total_agents(self, task):
         """返回特定任务的总agent数目（ally + enemy）"""
         if task in self.task2decomposer:
             task_decomposer = self.task2decomposer[task]
             return task_decomposer.n_agents + task_decomposer.n_enemies
         return 0
+    def preprocess_obs(self, inputs, task):
+        # hidden_state = hidden_state.reshape(-1, 1, self.entity_embed_dim)
+        # get decomposer, last_action_shape and n_agents of this specific task
+        task_decomposer = self.task2decomposer[task]
+        task_n_agents = self.task2n_agents[task]
+        last_action_shape = self.task2last_action_shape[task]
+
+        # decompose inputs into observation inputs, last_action_info, agent_id_info
+        obs_dim = task_decomposer.obs_dim
+        obs_inputs, last_action_inputs, agent_id_inputs = inputs[:, :obs_dim], \
+        inputs[:, obs_dim:obs_dim + last_action_shape], \
+        inputs[:, obs_dim + last_action_shape:]
+
+        # decompose observation input
+        # enemy_feats是一个list，长度为enemy_num, 包含了所有敌方智能体的特征，ally_feats也是一个list，包含了所有友方智能体的特征
+        own_obs, enemy_feats, ally_feats = task_decomposer.decompose_obs(
+            obs_inputs)  # own_obs: [bs*self.n_agents, own_obs_dim]
+        bs = int(own_obs.shape[0] / task_n_agents)
+
+        # embed agent_id inputs and decompose last_action_inputs
+        agent_id_inputs = [
+            th.as_tensor(binary_embed(i + 1, self.args.id_length, self.args.max_agent), dtype=own_obs.dtype) for i in
+            range(task_n_agents)]
+        agent_id_inputs = th.stack(agent_id_inputs, dim=0).repeat(bs, 1).to(own_obs.device)
+        _, attack_action_info, compact_action_states = task_decomposer.decompose_action_info(last_action_inputs)
+
+        # incorporate agent_id embed and compact_action_states
+        own_obs = th.cat([own_obs, agent_id_inputs, compact_action_states], dim=-1)
+
+        # incorporate attack_action_info into enemy_feats
+        attack_action_info = attack_action_info.transpose(0, 1).unsqueeze(-1)
+        # e.g.,原来enemy_feats为list，长度为enemy_num, 每一个元素为[bs * n_agents, obs_en_dim]，现在cat后就变成了[enemy_num, bs * n_agents, obs_en_dim+1]了
+        enemy_feats = th.cat([th.stack(enemy_feats, dim=0), attack_action_info], dim=-1)
+        ally_feats = th.stack(ally_feats, dim=0)
+        # batch, n_enemy, n_feats
+        enemy_feats = enemy_feats.permute(1, 0, 2)
+        # batch, n_ally, n_feats. 注意ally是比己方智能体数目少1的，因为还有一个是own
+        ally_feats = ally_feats.permute(1, 0, 2)
+        n_enemy, n_ally = enemy_feats.shape[1], ally_feats.shape[1]
+
+        own_stack, enemy_stack, ally_stack = own_obs.unsqueeze(1).unsqueeze(1), enemy_feats.unsqueeze(1), \
+        ally_feats.unsqueeze(1)
+
+        # compute key, query and value for attention
+        
+        own_hidden = self.own_process(own_stack)
+        ally_hidden = self.ally_process(ally_stack)
+        enemy_hidden = self.enemy_process(enemy_stack)
+
+        b = own_hidden.shape[0]
+        total_hidden = th.cat([own_hidden, enemy_hidden, ally_hidden], dim=2)
+        total_hidden = total_hidden.reshape(b, -1, self.entity_embed_dim)
+
+        outputs = self.transformer_process(total_hidden, None).reshape(b, self.args.num_stack_frames, -1, self.entity_embed_dim)
+        # outputs = outputs[:, :, :-1]
+
+        # own_out_h = outputs[:, -1, 0].unsqueeze(1)
+        # enemy_out_h = outputs[:, -1, 1:1+n_enemy]
+        # ally_out_h = outputs[:, -1, 1+n_enemy:1+n_enemy+n_ally]
+        
+        # return [own_out_h, enemy_out_h, ally_out_h]
+        # shape : [n_agents * bs, 1 + n_enemy + n_ally, entity_embed_dim]
+        return outputs[:,-1]
 
 
 class StateEncoder(nn.Module):
@@ -629,7 +707,7 @@ class PlannerModel(nn.Module):
         self.enemy_value = nn.Linear(obs_en_dim, self.entity_embed_dim)
         self.own_value = nn.Linear(wrapped_obs_own_dim, self.entity_embed_dim)
         self.value_vale = nn.Linear(1, self.entity_embed_dim)
-        self.transformer = Transformer(self.entity_embed_dim, args.head, args.depth, self.entity_embed_dim)
+        self.transformer = Transformer(self.entity_embed_dim, args.head, args.depth, self.entity_embed_dim)    
         self.obs_decoder = Transformer(self.entity_embed_dim, args.head, args.depth, self.entity_embed_dim)
 
         self.base_q_skill = nn.Linear(self.entity_embed_dim * 2, n_actions_no_attack)

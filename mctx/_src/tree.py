@@ -77,7 +77,8 @@ class Tree(Generic[T]):
   sampled_actions: np.ndarray  # [B, k]
   policy_hidden_states: torch.FloatTensor  # [B, N, hidden_dim]
   critic_hidden_states: torch.FloatTensor  # [B, N, hidden_dim]
-
+  # TODO: check，wm里面是一个list而不是单纯的tensor
+  wm_hidden_states: torch.FloatTensor  # [B, N, hidden_dim]
   # The following attributes are class variables (and should not be set on
   # Tree instances).
   ROOT_INDEX: ClassVar[int] = 0

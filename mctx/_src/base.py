@@ -50,7 +50,11 @@ class RecurrentFnOutput:
   value: chex.Array
   policy_hidden_states: chex.Array
   critic_hidden_states: chex.Array
+  wm_hidden_states: chex.Array
   sampled_actions: chex.Array
+
+
+
 
 
 Action = chex.Array
@@ -78,6 +82,7 @@ class RootFnOutput:
   observation: chex.Array
   new_policy_hidden_states: torch.Tensor
   new_critic_hidden_states: torch.Tensor
+  new_wm_hidden_states: torch.Tensor
   sampled_actions: chex.Array
 
 

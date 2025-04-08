@@ -70,7 +70,7 @@ class DemoOutput:
   selected_action_value: chex.Array
   action_weights_policy_value: chex.Array
 
-def initialize_root(network: PolicyRNN, embedding, observation, k: int, policy_hidden_states = None, critic_hidden_states = None,) -> mctx.RootFnOutput:
+def initialize_root(network: PolicyRNN, embedding, observation, k: int, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None) -> mctx.RootFnOutput:
     """
     Initializes the root node for the MCTS (Monte Carlo Tree Search) process.
 
@@ -116,6 +116,7 @@ def initialize_root(network: PolicyRNN, embedding, observation, k: int, policy_h
         observation=observation,
         new_policy_hidden_states=new_policy_hidden_states,
         new_critic_hidden_states=new_critic_hidden_states,
+        new_wm_hidden_states=wm_hidden_states,
         sampled_actions=sampled_actions
     )
     return root, experienced_thresholds, policy_hidden_states, critic_hidden_states

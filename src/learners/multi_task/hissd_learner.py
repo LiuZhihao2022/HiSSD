@@ -572,7 +572,7 @@ class HISSDLearner:
             self.logger.log_stat(f"{task}/plan_loss", planner_loss.item(), t_env)
             self.logger.log_stat(f"{task}/ssl_loss", ssl_loss.item(), t_env)
             self.logger.log_stat(f"{task}/reward_pred_loss", reward_pred_loss.item(), t_env)
-
+    # 这个函数是用来训练SSL的，主要是对比损失函数，但在这个代码中没用到
     def train_ssl(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         # Get the relevant quantities
         rewards = batch["reward"][:, :]
@@ -660,6 +660,7 @@ class HISSDLearner:
             dec_loss = 0
             ssl_loss = 0
             v_loss = 0
+            # TODO: 这里记得修改回来
             # dec_loss, ssl_loss, reward_pred_loss = self.train_vae(batch, t_env, episode_num, task)
             # self.update_last_batch(task, batch)
             # self.update(pretrain=False)

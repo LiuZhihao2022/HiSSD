@@ -354,7 +354,7 @@ class PolicyRNN(nn.Module):
             value, new_critic_hidden_state = self.critic_network(state, critic_hidden_state, use_target)
         return value, new_critic_hidden_state
 
-    def train_network(self, batch, gamma=0.99, value_loss_weight=0.5, max_grad_norm=10.0):
+    def train_network(self, batch, gamma=0.99, value_loss_weight=0.5, max_grad_norm=10.0, use_real_data = False):
         """
         Trains the network using the provided batch of data.
         Args:
@@ -367,12 +367,13 @@ class PolicyRNN(nn.Module):
         Returns:
             float: The total loss value after the training step.
         """
-        states, observations, actions, rewards, next_states, experienced_thresholds, improved_policy_probs, policy_hidden_states, critic_hidden_states, transformed_advantages, sampled_actions = prepare_batch_data(batch)
+        states, observations, actions, rewards, next_states, dones, experienced_thresholds, improved_policy_probs, policy_hidden_states, critic_hidden_states, transformed_advantages, sampled_actions = prepare_batch_data(batch, use_real_data)
         observations = torch.FloatTensor(observations).to(self.device)
         states = torch.FloatTensor(states).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
         rewards = torch.FloatTensor(rewards).to(self.device)
         next_states = torch.FloatTensor(next_states).to(self.device)
+        dones = torch.FloatTensor(dones).to(self.device)
         improved_policy_probs = torch.FloatTensor(improved_policy_probs).to(self.device)
         policy_hidden_states = torch.FloatTensor(policy_hidden_states).to(self.device)
         critic_hidden_states = torch.FloatTensor(critic_hidden_states).to(self.device)
@@ -398,6 +399,7 @@ class PolicyRNN(nn.Module):
             This allows us to evaluate the policy's performance on the sampled actions by multiplying the probabilities of the sampled actions
             to get the combined probabilities for each sample.
         '''
+        # 对于hier ma gumbel muzero来说，sampled_actions中的每一个，其实都是一个skill。skill的解码交给另外的解码器进行.做到最后，是可以通过policy直接获得skill而不需要mcts的
         gathered_probs = torch.gather(policy_probs.unsqueeze(1).expand(-1, sampled_actions.size(1), -1, -1), 3, sampled_actions.unsqueeze(-1)).squeeze(-1)
         gathered_logits = torch.gather(policy_logits.unsqueeze(1).expand(-1, sampled_actions.size(1), -1, -1), 3, sampled_actions.unsqueeze(-1)).squeeze(-1)
         # Compute the combined probabilities for each sampled action combination
@@ -412,7 +414,7 @@ class PolicyRNN(nn.Module):
         
         with torch.no_grad():
             target_values, _ = self.predict_value(next_states, new_critic_hidden_states.view(-1, self.hidden_dim), use_target=True)
-            target_values = rewards + gamma * target_values.squeeze(-1)
+            target_values = rewards + gamma * target_values.squeeze(-1) * (1 - dones)
         
         value_loss = nn.MSELoss()(predicted_values.squeeze(-1), target_values)
         # 总损失 (可以调整权重)
@@ -436,24 +438,33 @@ class PolicyRNN(nn.Module):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
+    def __init__(self, capacity: int, batch_size: int, c_steps: int = 1, use_real_data = False):
+        self.capacity = capacity//c_steps + 1
         self.buffer = []
         self.position = 0
+        self.batch_size = batch_size
+        self.use_real_data = use_real_data
 
-    def push(self, policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state):
-        # tree, action, action_weights = policy_output.search_tree, policy_output.action, policy_output.action_weights
-        batch_data = (policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state)
+    def push(self, policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state, real_r=None, real_next_obs=None, real_next_state=None, real_done = None):
+        assert root_critic_hidden_state.shape[0] == self.batch_size
+        if self.use_real_data == False:
+            batch_data = (policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state)
+        else:
+            assert real_next_obs.shape[0] == self.batch_size
+            assert real_next_state.shape[0] == self.batch_size
+            batch_data = (policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state, real_r, real_next_obs, real_next_state, real_done)
+        # 如果buffer未满，则直接添加数据
+        # 如果buffer已满，则覆盖最旧的数据
         if len(self.buffer) < self.capacity:
             self.buffer.append(batch_data)
         else:
             self.buffer[self.position] = batch_data
         self.position = (self.position + 1) % self.capacity
 
-    def sample(self, batch_size: int) -> Tuple:
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        batch = [self.buffer[i] for i in indices]
-        return batch
+    # def sample(self, batch_size: int) -> Tuple:
+    #     indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+    #     batch = [self.buffer[i] for i in indices]
+    #     return batch
     
     def clear(self):
         self.buffer = []
@@ -463,13 +474,43 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class ReplayBufferList:
+    def __init__(self, capacity: int, use_real_data = False):
+        self.capacity = capacity
+        self.replay_buffer_list = []
+        self.position = 0
+        self.use_real_data = use_real_data
+
+    def push(self, replay_buffer):
+        if len(self.replay_buffer_list) < self.capacity:
+            self.replay_buffer_list.append(replay_buffer)
+        else:
+            self.replay_buffer_list[self.position] = replay_buffer
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> list:
+        sample_size = max(batch_size // self.replay_buffer_list[0].batch_size, 1)
+        assert len(self.replay_buffer_list) >= batch_size, "No enough data to sample."
+        indices = np.random.choice(len(self.replay_buffer_list), batch_size, replace=False)
+        sampled_data = []
+        for i in indices:
+            sampled_data.extend(self.replay_buffer_list[i])
+        return sampled_data
+    
+    def clear(self):
+        self.replay_buffer_list = []
+        self.position = 0
+
+    def __len__(self):
+        return len(self.replay_buffer_list)
+
 def compute_prior_from_qvalues(q_values: np.ndarray, temperature: float = 0.5, max_min_transform: bool = True) -> np.ndarray:
     """从Q值计算动作先验概率"""
     if max_min_transform:
         q_values = (q_values - np.min(q_values, axis=-1, keepdims=True)) / (np.max(q_values, axis=-1, keepdims=True) - np.min(q_values, axis=-1, keepdims=True))
     return np.exp(q_values / temperature) / np.sum(np.exp(q_values / temperature), axis=-1, keepdims=True)
 
-def prepare_batch_data(sampled_batch: Tuple, max_visit_init = 50.0, value_scale = 0.1) -> Tuple:
+def prepare_batch_data(sampled_batch: Tuple, max_visit_init=50.0, value_scale=0.1, use_real_data=False) -> Tuple:
     states = np.array([])
     observations = np.array([])
     next_states = np.array([])
@@ -481,34 +522,45 @@ def prepare_batch_data(sampled_batch: Tuple, max_visit_init = 50.0, value_scale 
     experienced_thresholds = np.array([])
     advantages = np.array([])
     sampled_actions_list = np.array([])
+    dones = np.array([])
     visit_scales = np.array([])
-    for policy_output, experienced_threshold, advantage, root_policy_hidden_state, root_critic_hidden_state in sampled_batch:
+
+    for i in range(len(sampled_batch)):
+        if not use_real_data:
+            policy_output, experienced_threshold, advantage, root_policy_hidden_state, root_critic_hidden_state = sampled_batch[i]
+        else:
+            policy_output, experienced_threshold, advantage, root_policy_hidden_state, root_critic_hidden_state, real_r, real_next_obs, real_next_state, real_done = sampled_batch[i]
+
         tree, action, action_weights = policy_output.search_tree, policy_output.action, policy_output.action_weights
         root_idx = tree_lib.Tree.ROOT_INDEX
-        # 与 state = tree.embeddings[:, root_idx] 类似地获取 sampled_actions
         sampled_actions = tree.sampled_actions[:, root_idx]
-        # 仅使用根节点的数据
         batch_range = np.arange(tree.embeddings.shape[0])
-        root_idx = tree_lib.Tree.ROOT_INDEX
-        state = tree.embeddings[:, root_idx]
-        observation = tree.observations[:, root_idx]
-        reward = np.array([tree.children_rewards[br, root_idx, a] for br, a in zip(batch_range, action)])  
-        next_state = np.array([tree.embeddings[br, tree.children_index[br, root_idx, a]] for br, a in zip(batch_range, action)])
         visit_count = tree.children_visits[batch_range, root_idx]
         max_visit = np.max(visit_count, axis=-1, keepdims=True)
-        visit_scale =  max_visit + max_visit_init
+        visit_scale = max_visit + max_visit_init
         transformed_advantage = visit_scale * value_scale * advantage
-        # policy_hidden_state = tree.policy_hidden_states[:, root_idx]
-        # critic_hidden_state = tree.critic_hidden_states[:, root_idx]
-        # 收集结果
-        # TODO:先看看advantage是什么形状的
-        
+
+        if not use_real_data:
+            state = tree.embeddings[:, root_idx]
+            observation = tree.observations[:, root_idx]
+            reward = np.array([tree.children_rewards[br, root_idx, a] for br, a in zip(batch_range, action)])
+            next_state = np.array([tree.embeddings[br, tree.children_index[br, root_idx, a]] for br, a in zip(batch_range, action)])
+            # note there is no end in current world model, so the done is always False
+            done = np.zeros_like(reward, dtype=bool)
+        else:
+            # TODO: check shape here
+            state = real_next_state
+            observation = real_next_obs
+            reward = real_r
+            next_state = real_next_state
+            done = real_done
         if len(states) == 0:
             states = state
             observations = observation
             actions = action
             rewards = reward
             next_states = next_state
+            dones = done
             experienced_thresholds = experienced_threshold
             improved_policy_probs = action_weights
             policy_hidden_states = root_policy_hidden_state.detach().cpu().numpy()
@@ -520,6 +572,7 @@ def prepare_batch_data(sampled_batch: Tuple, max_visit_init = 50.0, value_scale 
             observations = np.concatenate((observations, observation))
             actions = np.concatenate((actions, action))
             rewards = np.concatenate((rewards, reward))
+            dones = np.concatenate((dones, done))
             next_states = np.concatenate((next_states, next_state))
             experienced_thresholds = np.concatenate((experienced_thresholds, experienced_threshold))
             improved_policy_probs = np.concatenate((improved_policy_probs, action_weights))
@@ -528,11 +581,12 @@ def prepare_batch_data(sampled_batch: Tuple, max_visit_init = 50.0, value_scale 
             advantages = np.concatenate((advantages, transformed_advantage))
             sampled_actions_list = np.concatenate((sampled_actions_list, sampled_actions))
 
-    return (np.array(states), 
+    return (np.array(states),
             np.array(observations),
-            np.array(actions), 
-            np.array(rewards), 
+            np.array(actions),
+            np.array(rewards),
             np.array(next_states),
+            np.array(dones),
             np.array(experienced_thresholds),
             np.array(improved_policy_probs),
             np.array(policy_hidden_states),

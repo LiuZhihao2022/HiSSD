@@ -8,7 +8,7 @@ import torch.distributions as D
 import numpy as np
 import torch.nn.functional as F
 
-
+from utils.embed import binary_embed
 # This multi-agent controller shares parameters between agents
 class HISSDSMAC:
     def __init__(self, train_tasks, task2scheme, task2args, main_args):
@@ -357,7 +357,9 @@ class HISSDSMAC:
         self.hidden_states_dis_for_act = hidden_states_dis_for_act.unsqueeze(0).expand(
             batch_size, n_agents, -1
         )
-        hidden_state_wm = [hidden_states_reward, hidden_states_value]
+        hidden_states_reward = hidden_states_reward.unsqueeze(1)
+        hidden_states_value = hidden_states_value.unsqueeze(1)
+        hidden_state_wm = th.cat([hidden_states_reward, hidden_states_value], dim=1)
         return hidden_state_wm
 
     def parameters(self):
@@ -451,19 +453,10 @@ class HISSDSMAC:
     def forward_action_skill(self, ep_batch, t, skill_index, task, test_mode=False):
         agent_inputs = self._build_inputs(ep_batch, t, task)
         avail_actions = ep_batch["avail_actions"][:, t]
-        actions = ep_batch["actions"][:, t]
-        # 获取codebook
-        codebook = self.get_codebook()
-        if codebook is None or skill_index is None:
-            raise ValueError("无法获取codebook或skill_index无效")
         
         # 使用skill_index获取对应的code
         device = agent_inputs.device
-    
-        if isinstance(skill_index, th.Tensor):
-            skill_code = codebook[skill_index]
-        else:
-            skill_code = codebook[th.tensor(skill_index, device=device)]
+        skill_code = self.get_skill(skill_index)
         
         task_args, n_agents = self.task2args[task], self.task2n_agents[task]
         task_decomposer = self.task2decomposer[task]
@@ -522,7 +515,9 @@ class HISSDSMAC:
     def get_codebook(self):
         """返回agent中planner的skill模块的codebook"""
         return self.agent.get_codebook()
-
+    def get_skill(self, skill_index):
+        """返回agent中planner的skill模块的skill"""
+        return self.agent.get_skill(skill_index)
     def get_total_agents(self, task):
         """返回特定任务的总agent数目（ally + enemy）"""
         return self.agent.get_total_agents(task)
@@ -531,7 +526,7 @@ class HISSDSMAC:
     def world_model_predict(self, batch_obs, batch_last_action, skill_index, hidden_state_wm, task):
         # 获取当前的obs，是使用build过后的inputs去重建obs的
         # 这个batch应该是一个包含batch_size的，但是到mctx里面怎么batch地使用？
-        hidden_state_reward, hidden_state_value = hidden_state_wm
+        hidden_state_reward, hidden_state_value = hidden_state_wm[:, 0], hidden_state_wm[:, 1]
         bs = batch_obs.shape[0]
         inputs = []
         inputs.append(batch_obs)
@@ -559,11 +554,9 @@ class HISSDSMAC:
         
         # 使用skill_index获取对应的code
         device = agent_inputs.device
-    
-        if isinstance(skill_index, th.Tensor):
-            skill_code = codebook[skill_index]
-        else:
-            skill_code = codebook[th.tensor(skill_index, device=device)]
+        
+        # TODO: skill code是这么获得的吗？是竖着的还是横着的？
+        skill_code = self.mac.get_skill(skill_index)
         # TODO:这个skill应该是什么shape?
         own_skill = skill_code[:, 0].unsqueeze(1)
         enemy_skill = skill_code[:, 1:1+n_enemy]
@@ -605,5 +598,14 @@ class HISSDSMAC:
             )
 
             # update hidden state
-            hidden_state_wm = [hidden_state_reward, hidden_state_value]
+            hidden_state_reward = hidden_state_reward.unsqueeze(1)
+            hidden_state_value = hidden_state_value.unsqueeze(1)
+            hidden_state_wm = th.cat([hidden_state_reward, hidden_state_value], dim=1)
             return next_obs, next_state, reward_pred, value_pred, hidden_state_wm
+
+    def preprocess_obs(self, batch, t, task):
+        # inputs = th.cat([x.reshape(bs * n_agents, -1) for x in inputs], dim=1)
+        # batch_obs = batch_obs.reshape(-1, batch_obs.shape[-1])
+        # 调用agent的预处理函数
+        agent_inputs = self._build_inputs(batch, t, task)
+        return self.agent.preprocess_obs(agent_inputs, task)
