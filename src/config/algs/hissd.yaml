@@ -75,3 +75,5 @@ noise_weight: 0.
 adaptation: False
 debug: False
 obs_process_dim: 16
+state_embed_dim: 64
+save_model_interval_online: 50000

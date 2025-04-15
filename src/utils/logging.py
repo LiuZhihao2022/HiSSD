@@ -2,6 +2,7 @@ from collections import defaultdict
 import logging
 import numpy as np
 from tensorboardX.writer import SummaryWriter
+import wandb  # 添加wandb导入
 
 class Logger:
     def __init__(self, console_logger):
@@ -42,7 +43,7 @@ class Logger:
 
     def log_embedding(self, key, value):
         self.writer.add_embedding(value, tag=key)
-
+    # TODO: 或许记录均值的部分应该加到这个函数里，这样就可以打印的同时进行记录了
     def print_recent_stats(self):
         log_str = "Recent Stats | t_env: {:>10}\t Episode: {:>10}\n".format(self.stats["episode"][-1][0], self.stats["episode"][-1][1])
         i = 0

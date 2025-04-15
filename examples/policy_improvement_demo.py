@@ -45,7 +45,7 @@ flags.DEFINE_integer("num_runs", 1000, "Number of runs on random data.")
 # ma-gumbel-muzero是一个on-policy算法，因为在计算经验阈值概率的时候需要用已经保存的pertubed value和当前网络计算出来的comb_logits，所以不能存很长的buffer
 flags.DEFINE_integer("replay_buffer_capacity", 1, "Capacity of the replay buffer.")
 flags.DEFINE_integer("target_update_interval", 20, "Interval for updating the target network.")
-flags.DEFINE_integer("embedding_dim", 5, "Dimension of the embedding.")
+flags.DEFINE_integer("state_inputs_dim", 5, "Dimension of the embedding.")
 flags.DEFINE_integer("observation_dim", 1, "Dimension of the observation.")
 flags.DEFINE_boolean("use_pmap", False, "Whether to use pmap for parallel training.")
 
@@ -70,13 +70,13 @@ class DemoOutput:
   selected_action_value: chex.Array
   action_weights_policy_value: chex.Array
 
-def initialize_root(network: PolicyRNN, embedding, observation, k: int, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None) -> mctx.RootFnOutput:
+def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=FLAGS.num_agents, num_actions=FLAGS.num_actions, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None) -> mctx.RootFnOutput:
     """
     Initializes the root node for the MCTS (Monte Carlo Tree Search) process.
 
     Args:
         network (PolicyRNN): The policy-value network used to predict policy and value.
-        embedding: The embedding of the current state.
+        state_inputs: The embedding of the current state.
         observation: The observation of the current state.
         temperature: The temperature parameter for stochastic sampling.
         k (int): The number of top actions to sample.
@@ -88,13 +88,19 @@ def initialize_root(network: PolicyRNN, embedding, observation, k: int, policy_h
                            new policy hidden states, new critic hidden states, and sampled actions.
     """
     # 初始化hidden states
-    batch_size = embedding.shape[0]
+    batch_size = state.shape[0]
+    if wm_hidden_states is not None and not isinstance(wm_hidden_states, np.ndarray):
+        if isinstance(wm_hidden_states, torch.Tensor):
+            wm_hidden_states = wm_hidden_states.detach().cpu().numpy()
+        else:
+            wm_hidden_states = np.array(wm_hidden_states)
     if policy_hidden_states is None or critic_hidden_states is None:
-        policy_hidden_states, critic_hidden_states = network.init_hidden(batch_size= batch_size)
+        # policy_hidden_states, critic_hidden_states = network.init_hidden(batch_size= batch_size)
+        policy_hidden_states, critic_hidden_states = network.get_hidden_states()
 
     # 使用stochastic_top_k_sampling选取动作
     batched_sampled_queues_with_reference, new_policy_hidden_states = stochastic_top_k_sampling(
-        FLAGS.num_agents, network, observation, policy_hidden_states, FLAGS.num_actions, k+1
+        num_agents, network, observation, policy_hidden_states, num_actions, k+1
     )
     batched_sampled_queues = [batch[:-1] for batch in batched_sampled_queues_with_reference]
     experienced_thresholds = [batch[-1][2] for batch in batched_sampled_queues_with_reference]
@@ -106,13 +112,13 @@ def initialize_root(network: PolicyRNN, embedding, observation, k: int, policy_h
     sampled_actions = np.array(sampled_actions)
     prior_logits = np.array(prior_logits)
     # 使用model计算选取动作的value
-    value, new_critic_hidden_states = network.predict_value(embedding, critic_hidden_states)
+    value, new_critic_hidden_states = network.predict_value(state, critic_hidden_states)
     value = value.detach().cpu().numpy().flatten()
     new_critic_hidden_states = new_critic_hidden_states.detach().cpu().numpy()
     root = mctx.RootFnOutput(
         prior_logits=prior_logits,
         value=value,
-        embedding=embedding,
+        embedding=state,
         observation=observation,
         new_policy_hidden_states=new_policy_hidden_states,
         new_critic_hidden_states=new_critic_hidden_states,
@@ -126,7 +132,7 @@ def _run_demo(rng, network: PolicyRNN, recurrent_fn, temperature) -> Tuple[np.ra
     rng, value_rng, search_rng = np.random.RandomState(), np.random.RandomState(), np.random.RandomState()
 
     # 创建batch的初始状态embedding
-    embedding = np.random.randint(0, 10, size=(batch_size, FLAGS.embedding_dim))
+    embedding = np.random.randint(0, 10, size=(batch_size, FLAGS.state_inputs_dim))
     # TODO:这里还要改成多个agent的情况
     observation = embedding.reshape(batch_size, FLAGS.num_agents, FLAGS.observation_dim)
 
@@ -139,6 +145,7 @@ def _run_demo(rng, network: PolicyRNN, recurrent_fn, temperature) -> Tuple[np.ra
         root=root,
         recurrent_fn=recurrent_fn,
         num_simulations=FLAGS.num_simulations,
+        task=task,
         max_num_considered_actions=FLAGS.max_num_considered_actions,
         max_depth=FLAGS.max_depth,
         qtransform=functools.partial(
@@ -156,8 +163,8 @@ def main(_):
     replay_buffer = ReplayBuffer(FLAGS.replay_buffer_capacity)
     
     # 创建环境并生成recurrent_fn
-    # network = PolicyValueNetwork(FLAGS.embedding_dim, FLAGS.num_actions)
-    network = PolicyRNN(FLAGS.observation_dim, FLAGS.embedding_dim, FLAGS.num_actions, FLAGS.num_agents)
+    # network = PolicyValueNetwork(FLAGS.state_inputs_dim, FLAGS.num_actions)
+    network = PolicyRNN(FLAGS.observation_dim, FLAGS.state_inputs_dim, FLAGS.num_actions, FLAGS.num_agents)
     print(f"Neural network is using device: {network.device}")
     # network.initialize(lr=FLAGS.lr)
     jitted_run_demo = _run_demo

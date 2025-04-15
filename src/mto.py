@@ -197,30 +197,30 @@ def train_sequential(
         n_test_runs = 0
     if main_args.debug:
         n_test_runs = 0
-    test_start_time = time.time()
+    # test_start_time = time.time()
 
-    with th.no_grad():
-        for task in main_args.test_tasks:
-            task2runner[task].t_env = t_env
-            for _ in range(n_test_runs):
-                task2runner[task].run(test_mode=True, pretrain=pretrain)
+    # with th.no_grad():
+    #     for task in main_args.test_tasks:
+    #         task2runner[task].t_env = t_env
+    #         for _ in range(n_test_runs):
+    #             task2runner[task].run(test_mode=True, pretrain=pretrain)
 
-        # test_pretrain for pretrained tasks
-        if pretrain and test_task2offlinedata is not None:
-            for task, data_buffer in test_task2offlinedata.items():
-                episode_sample = data_buffer.sample(batch_size_train * 3)
+    #     # test_pretrain for pretrained tasks
+    #     if pretrain and test_task2offlinedata is not None:
+    #         for task, data_buffer in test_task2offlinedata.items():
+    #             episode_sample = data_buffer.sample(batch_size_train * 3)
 
-                if episode_sample.device != task2args[task].device:
-                    episode_sample.to(task2args[task].device)
+    #             if episode_sample.device != task2args[task].device:
+    #                 episode_sample.to(task2args[task].device)
 
-                if hasattr(learner, "test_pretrain"):
-                    learner.test_pretrain(episode_sample, t_env, episode, task)
-                else:
-                    raise ValueError(
-                        "Do test_pretrain with a learner that does not have a `test_pretrain` method!"
-                    )
+    #             if hasattr(learner, "test_pretrain"):
+    #                 learner.test_pretrain(episode_sample, t_env, episode, task)
+    #             else:
+    #                 raise ValueError(
+    #                     "Do test_pretrain with a learner that does not have a `test_pretrain` method!"
+    #                 )
 
-    test_time_total += time.time() - test_start_time
+    # test_time_total += time.time() - test_start_time
 
     while t_env < t_max:
         # shuffle tasks
@@ -258,7 +258,8 @@ def train_sequential(
             break
 
         # Execute test runs once in a while & final evaluation
-        if (t_env - last_test_T) / main_args.test_interval >= 1 or t_env >= t_max:
+        # if (t_env - last_test_T) / main_args.test_interval >= 1 or t_env >= t_max:
+        if True:
             test_start_time = time.time()
 
             with th.no_grad():

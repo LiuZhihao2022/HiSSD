@@ -97,6 +97,9 @@ def gumbel_muzero_policy(
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
     num_simulations: int,
+    task: str,
+    current_t_env: int,
+    args,
     invalid_actions: Optional[np.ndarray] = None,
     max_depth: Optional[int] = None,
     loop_fn: base.LoopFn = None,
@@ -173,6 +176,9 @@ def gumbel_muzero_policy(
           qtransform=qtransform,
       ),
       num_simulations=num_simulations,
+      task=task,
+      current_t_env=current_t_env,
+      args=args,
       max_depth=max_depth,
       invalid_actions=invalid_actions,
       extra_data=extra_data,
@@ -190,10 +196,15 @@ def gumbel_muzero_policy(
   to_argmax = seq_halving.score_considered(
       considered_visit, gumbel, root.prior_logits, completed_qvalues,
       summary.visit_counts)
+  # 这里的action只是sampled_actions里的序号。还需要使用这个action将sampled_actions进行解码
   action = action_selection.masked_argmax(to_argmax, invalid_actions)
   batch_size = infer_batch_size(search_tree)
   node_index = np.full([batch_size], search_tree.ROOT_INDEX)
   advantages = compute_advantage(search_tree, node_index)
+  batch_range = np.arange(batch_size)
+  chosen_skill = jax.tree_util.tree_map(
+      lambda x: x[batch_range, search_tree.ROOT_INDEX, action], search_tree.sampled_actions)
+  # chosen_skill = search_tree.sampled_actions[batch_range, search_tree.ROOT_INDEX, action]
   # Producing action_weights usable to train the policy network.
   completed_search_logits = _mask_invalid_actions(
       root.prior_logits + completed_qvalues, invalid_actions)
@@ -201,6 +212,7 @@ def gumbel_muzero_policy(
   action_weights = jax.nn.softmax(completed_search_logits)
   return base.PolicyOutput(
       action=action,
+      chosen_skill = chosen_skill,
       action_weights=action_weights,
       search_tree=search_tree), timing_stats, advantages
 

@@ -5,6 +5,24 @@ from typing import List, Tuple
 import torch
 import jax
 import jax.numpy as jnp
+
+def compute_offline_value_weight(t: int, offline_value_start: float, offline_value_end: float, offline_value_anneal_time: int) -> float:
+    """
+    计算随着时间的推移而衰减的offline value权重
+    
+    Args:
+        t: 当前的训练步骤
+        offline_value_start: 初始权重值
+        offline_value_end: 最终权重值
+        offline_value_anneal_time: 权重从初始值衰减到最终值所需的步骤数
+        
+    Returns:
+        float: 当前步骤的offline value权重
+    """
+    # 线性衰减
+    frac = min(1.0, t / offline_value_anneal_time)
+    return offline_value_start + frac * (offline_value_end - offline_value_start)
+
 def convert_tree_to_graph(
     tree,
     action_labels: Optional[Sequence[str]] = None,

@@ -60,6 +60,14 @@ class HierMCTSEpisodeRunner:
         self.current_skill_index = None
         self.wm_hidden_states = None
 
+        # 添加MCTS统计信息的字段
+        self.mcts_stats = {
+            "chosen_skills": [],  # 记录选择的技能
+            "mcts_values": [],    # 记录MCTS估计的值
+            "avg_depth": [],      # 记录平均搜索深度
+            "avg_visit_count": [] # 记录平均访问次数
+        }
+
     def setup(self, scheme, groups, preprocess, mac, mcts_network):
         self.new_batch = partial(
             EpisodeBatch,
@@ -87,8 +95,11 @@ class HierMCTSEpisodeRunner:
             self.batch_size, 
             self.mcts_network,
             self.temperature,
-            self.n_agents + self.n_ally,
-            self.k
+            self.n_agents,
+            self.k,
+            offline_value_start=self.args.offline_value_start,
+            offline_value_end=self.args.offline_value_end,
+            offline_value_anneal_time=self.args.offline_value_anneal_time,
         )
         self.replay_buffer_mcts = ReplayBuffer(
             self.episode_limit//self.c_step + 1,
@@ -133,17 +144,23 @@ class HierMCTSEpisodeRunner:
         episode_return = 0
         self.mac.init_hidden(batch_size=self.batch_size, task=self.task)
         
+        # 用于存储最后一步的env_info
+        final_env_info = {}
+        
         while not terminated:
             # 获取当前状态和观测
             pre_transition_data = {
                 "state": [self.env.get_state()],
                 "avail_actions": [self.env.get_avail_actions()],
+                # "avail_actions": [np.ones((self.n_agents, self.args.skill_dim))],
+                "avail_skills": [np.ones((self.n_agents, self.args.skill_dim))],
                 "obs": [self.env.get_obs()],
             }
             self.batch.update(pre_transition_data, ts=self.t)
             
             current_state = self.batch["state"][:, self.t]
-            current_obs = self.batch["obs"][:, self.t]
+            # current_obs = self.batch["obs"][:, self.t]
+            current_input = self.mac._build_inputs(self.batch, t=self.t, task=self.task).reshape(self.batch_size, self.n_agents, -1)
             
             if self.t % self.c_step == 0:
                 # 存储上一个周期的MCTS数据（如果有）
@@ -156,7 +173,8 @@ class HierMCTSEpisodeRunner:
                         root_policy_hidden_state, 
                         root_critic_hidden_state,
                         real_r=self.accumulated_reward,
-                        real_next_obs=current_obs,
+                        # real_next_obs=current_obs,
+                        real_next_obs=current_input,
                         real_next_state=current_state,
                         real_done=np.zeros(self.batch_size, dtype=bool)  # 中间步骤不是终止状态
                     )
@@ -168,7 +186,7 @@ class HierMCTSEpisodeRunner:
                 self.current_mcts_data = mcts_results[1:]
                 # self.current_skill = self.mac.get_skill(self.current_skill_index)
                 self.last_skill_selection_t = self.t
-                self.last_observation = current_obs
+                self.last_observation = current_input
                 self.last_state = current_state
             
             # 使用当前选择的skill来选择动作. 已经内置好了将skill_index转变为emb，这里不需要转了
@@ -181,16 +199,21 @@ class HierMCTSEpisodeRunner:
             )
             
             # 选择动作并与环境交互
-            chosen_actions = self.action_selector.select_action(
+            chosen_actions = self.mac.action_selector.select_action(
                 actions,
                 self.batch["avail_actions"][:, self.t],
                 t_env=self.t_env,
-                test_mode=test_mode
+                # decoder已经在offline training阶段训练好了，在这里直接使用，不要有随机性了
+                test_mode=True
             )
             
             reward, terminated, env_info = self.env.step(chosen_actions[0])
             episode_return += reward
             self.accumulated_reward = self.args.gamma*self.accumulated_reward + reward  # 累积当前skill周期的奖励
+            
+            # 存储最后一步的env_info，用于获取battle_won等信息
+            if terminated:
+                final_env_info = env_info
             
             post_transition_data = {
                 "actions": chosen_actions,
@@ -211,12 +234,14 @@ class HierMCTSEpisodeRunner:
             last_data = {
                 "state": [self.env.get_state()],
                 "avail_actions": [self.env.get_avail_actions()],
+                "avail_skills": [np.ones((self.n_agents, self.args.skill_dim))],
                 "obs": [self.env.get_obs()],
             }
             self.batch.update(last_data, ts=self.t)
             
             final_state = self.batch["state"][:, self.t]
-            final_obs = self.batch["obs"][:, self.t]
+            # final_obs = self.batch["obs"][:, self.t]
+            final_input = self.mac._build_inputs(self.batch,t=self.t,task=self.task).reshape(self.batch_size, self.n_agents, -1)
             
             policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state = self.current_mcts_data
             self.replay_buffer_mcts.push(
@@ -226,34 +251,11 @@ class HierMCTSEpisodeRunner:
                 root_policy_hidden_state, 
                 root_critic_hidden_state,
                 real_r=self.accumulated_reward,
-                real_next_obs=final_obs,
+                # real_next_obs=final_obs,
+                real_next_obs=final_input,
                 real_next_state=final_state,
                 real_done=np.ones(self.batch_size, dtype=bool)  # 结束状态
             )
-        
-        last_data = {
-            "state": [self.env.get_state()],
-            "avail_actions": [self.env.get_avail_actions()],
-            "obs": [self.env.get_obs()],
-        }
-        self.batch.update(last_data, ts=self.t)
-
-        # 最后一个状态的动作选择
-        actions = self.mac.forward_action_skill(
-            self.batch,
-            t=self.t,
-            skill_index=self.current_skill_index,
-            task=self.task,
-            test_mode=test_mode,
-        )
-        
-        chosen_actions = self.action_selector.select_action(
-            actions,
-            self.batch["avail_actions"][:, self.t],
-            t_env=self.t_env,
-            test_mode=test_mode
-        )
-        self.batch.update({"actions": chosen_actions}, ts=self.t)
 
         cur_stats = self.test_stats if test_mode else self.train_stats
         cur_returns = self.test_returns if test_mode else self.train_returns
@@ -286,7 +288,18 @@ class HierMCTSEpisodeRunner:
                         )
                 self.log_train_stats_t = self.t_env
 
-        return self.batch, self.replay_buffer_mcts
+        # 在函数结束前，从env_info中获取battle_won信息，而不是从batch中
+        win = 0
+        if "battle_won" in final_env_info:
+            win = int(final_env_info["battle_won"])
+        
+        # 返回batch、replay_buffer以及统计信息
+        return self.batch, self.replay_buffer_mcts, {
+            "episode_return": episode_return,
+            "win": win,
+            "episode_length": self.t,
+            "stats": dict(final_env_info) if final_env_info else {}
+        }
 
     def _select_skill_with_mcts(self):
         """
@@ -310,19 +323,23 @@ class HierMCTSEpisodeRunner:
             batch_last_action = self.batch["actions_onehot"][:, self.t - 1]
         
         # 获取初始状态的embedding
-        embedding = state_inputs.reshape(bs, -1)
+        state_inputs = state_inputs.reshape(bs, -1).cpu().numpy()
         # observation = batch_obs.reshape(self.batch_size, self.n_agents, -1)
         # TODO: 这里要区分一下是不是real data，只有不是的时候才需要处理. 不过暂时都处理了
         # TODO: 输出的shape是什么意思？能不能直接用来做embedding？
-        obs_inputs = self.mac.preprocess_obs(self.batch, self.t, self.task)
+        obs_inputs = self.mac.preprocess_obs(self.batch, self.t, self.task).cpu().numpy()
         # 初始化根节点
         root, experienced_thresholds, root_policy_hidden_state, root_critic_hidden_state = initialize_root(
             self.mcts_network, 
-            embedding, 
+            state_inputs, 
             obs_inputs, 
             self.k,
+            self.n_agents,
+            self.args.skill_dim,
+            
             # 将wm_hidden_states传入，然后随着每一步的更新而更新
-            self.wm_hidden_states
+            # TODO: 传入时不能是torch类型，需要在外面或者在里面更改
+            wm_hidden_states= self.wm_hidden_states
         )
         
         # 运行MCTS搜索
@@ -332,6 +349,9 @@ class HierMCTSEpisodeRunner:
             root=root,
             recurrent_fn=self.recurrent_fn,
             num_simulations=self.num_simulations,
+            task=self.task,
+            current_t_env=self.t_env,
+            args=self.args,
             max_num_considered_actions=self.max_num_considered_actions,
             max_depth=None,
             qtransform=functools.partial(
@@ -341,7 +361,22 @@ class HierMCTSEpisodeRunner:
         )
         # TODO: 这里需要看一看hidden_states_wm以及action怎么索引到，随后更新self.wm_hidden_states
         # new_hidden_states_wm = 
-        return policy_output.action, policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state
+
+        # 记录MCTS统计信息
+        if hasattr(policy_output, "search_statistics"):
+            stats = policy_output.search_statistics
+            if stats is not None:
+                if hasattr(stats, "avg_depth"):
+                    self.mcts_stats["avg_depth"].append(stats.avg_depth)
+                if hasattr(stats, "avg_visit_count"):
+                    self.mcts_stats["avg_visit_count"].append(stats.avg_visit_count)
+        
+        self.mcts_stats["chosen_skills"].append(policy_output.chosen_skill)
+        
+        if hasattr(policy_output, "estimated_value"):
+            self.mcts_stats["mcts_values"].append(policy_output.estimated_value)
+        
+        return policy_output.chosen_skill, policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state
 
     def _log(self, returns, stats, prefix):
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)
@@ -371,6 +406,7 @@ class HierMCTSEpisodeRunner:
             pre_transition_data = {
                 "state": [self.env.get_state()],
                 "avail_actions": [self.env.get_avail_actions()],
+                "avail_skills": [np.ones((self.n_agents, self.args.skill_dim))],
                 "obs": [self.env.get_obs()],
             }
 
@@ -404,6 +440,7 @@ class HierMCTSEpisodeRunner:
         last_data = {
             "state": [self.env.get_state()],
             "avail_actions": [self.env.get_avail_actions()],
+            "avail_skills": [np.ones((self.n_agents, self.args.skill_dim))],
             "obs": [self.env.get_obs()],
         }
         self.batch.update(last_data, ts=self.t)

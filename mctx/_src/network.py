@@ -284,18 +284,23 @@ class PolicyRNN(nn.Module):
             self.optimizer = torch.optim.RMSprop(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), lr=1e-3)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
+    def get_hidden_states(self):
+        return self.policy_hidden, self.critic_hidden
     def init_hidden(self, batch_size=1):
-        policy_hidden = self.policy_network.init_hidden(batch_size, self.num_agents)
-        critic_hidden = self.critic_network.init_hidden(batch_size)
+        self.policy_hidden = self.policy_network.init_hidden(batch_size, self.num_agents)
+        self.critic_hidden = self.critic_network.init_hidden(batch_size)
         if self.device == 'cuda':
-            policy_hidden = policy_hidden.cuda()
-            critic_hidden = critic_hidden.cuda()
-        return policy_hidden, critic_hidden
+            self.policy_hidden = self.policy_hidden.cuda()
+            self.critic_hidden = self.critic_hidden.cuda()
+        return self.policy_hidden, self.critic_hidden
 
     def random_init_hidden(self, seed, batch_size=1):
-        policy_weights = self.policy_network.random_init_hidden(seed, batch_size, self.num_agents)
-        critic_weights = self.critic_network.random_init_hidden(seed, batch_size)
-        return policy_weights, critic_weights
+        self.policy_weights = self.policy_network.random_init_hidden(seed, batch_size, self.num_agents)
+        self.critic_weights = self.critic_network.random_init_hidden(seed, batch_size)
+        if self.device == 'cuda':
+            self.policy_hidden = self.policy_hidden.cuda()
+            self.critic_hidden = self.critic_hidden.cuda()
+        return self.policy_weights, self.critic_weights
 
     def forward(self, state, observation, policy_hidden_state, critic_hidden_state):
         """
@@ -327,7 +332,7 @@ class PolicyRNN(nn.Module):
         return policy_logits, predicted_values, policy_hh, critic_hh
 
     def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
-        avail_actions = ep_batch["avail_actions"][:, t_ep]
+        avail_actions = ep_batch["avail_skills"][:, t_ep]
         agent_inputs = ep_batch["obs"][:, t_ep]
         policy_hidden_state, _ = self.init_hidden()
         agent_outputs, _, _, _ = self.forward(agent_inputs, policy_hidden_state, None)
@@ -367,7 +372,7 @@ class PolicyRNN(nn.Module):
         Returns:
             float: The total loss value after the training step.
         """
-        states, observations, actions, rewards, next_states, dones, experienced_thresholds, improved_policy_probs, policy_hidden_states, critic_hidden_states, transformed_advantages, sampled_actions = prepare_batch_data(batch, use_real_data)
+        states, observations, actions, rewards, next_states, dones, experienced_thresholds, improved_policy_probs, policy_hidden_states, critic_hidden_states, transformed_advantages, sampled_actions = prepare_batch_data(batch, use_real_data=use_real_data)
         observations = torch.FloatTensor(observations).to(self.device)
         states = torch.FloatTensor(states).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
@@ -425,7 +430,12 @@ class PolicyRNN(nn.Module):
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), max_grad_norm)
         self.optimizer.step()
-        return total_loss.item()
+        loss_dict = {
+            "policy_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "total_loss": total_loss.item()
+        }
+        return loss_dict
 
     def update_target_network(self):
         self.critic_network.update_target_network()
@@ -439,7 +449,7 @@ class PolicyRNN(nn.Module):
 
 class ReplayBuffer:
     def __init__(self, capacity: int, batch_size: int, c_steps: int = 1, use_real_data = False):
-        self.capacity = capacity//c_steps + 1
+        self.capacity = capacity
         self.buffer = []
         self.position = 0
         self.batch_size = batch_size
@@ -491,10 +501,10 @@ class ReplayBufferList:
     def sample(self, batch_size: int) -> list:
         sample_size = max(batch_size // self.replay_buffer_list[0].batch_size, 1)
         assert len(self.replay_buffer_list) >= batch_size, "No enough data to sample."
-        indices = np.random.choice(len(self.replay_buffer_list), batch_size, replace=False)
+        indices = np.random.choice(len(self.replay_buffer_list), sample_size, replace=False)
         sampled_data = []
         for i in indices:
-            sampled_data.extend(self.replay_buffer_list[i])
+            sampled_data.extend(self.replay_buffer_list[i].buffer)
         return sampled_data
     
     def clear(self):
@@ -551,15 +561,15 @@ def prepare_batch_data(sampled_batch: Tuple, max_visit_init=50.0, value_scale=0.
             # TODO: check shape here
             state = real_next_state
             observation = real_next_obs
-            reward = real_r
+            reward = [real_r]
             next_state = real_next_state
-            done = real_done
+            done = [real_done]
         if len(states) == 0:
-            states = state
-            observations = observation
+            states = state.detach().cpu().numpy()
+            observations = observation.detach().cpu().numpy()
             actions = action
             rewards = reward
-            next_states = next_state
+            next_states = next_state.detach().cpu().numpy()
             dones = done
             experienced_thresholds = experienced_threshold
             improved_policy_probs = action_weights
@@ -568,12 +578,12 @@ def prepare_batch_data(sampled_batch: Tuple, max_visit_init=50.0, value_scale=0.
             advantages = transformed_advantage
             sampled_actions_list = sampled_actions
         else:
-            states = np.concatenate((states, state))
-            observations = np.concatenate((observations, observation))
+            states = np.concatenate((states, state.detach().cpu().numpy()))
+            observations = np.concatenate((observations, observation.detach().cpu().numpy()))
             actions = np.concatenate((actions, action))
             rewards = np.concatenate((rewards, reward))
             dones = np.concatenate((dones, done))
-            next_states = np.concatenate((next_states, next_state))
+            next_states = np.concatenate((next_states, next_state.detach().cpu().numpy()))
             experienced_thresholds = np.concatenate((experienced_thresholds, experienced_threshold))
             improved_policy_probs = np.concatenate((improved_policy_probs, action_weights))
             policy_hidden_states = np.concatenate((policy_hidden_states, root_policy_hidden_state.detach().cpu().numpy()))

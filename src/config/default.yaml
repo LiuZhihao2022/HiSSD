@@ -26,6 +26,12 @@ load_step: 0 # Load model trained on this many timesteps (0 if choose max possib
 save_replay: False # Saving the replay of the model loaded from checkpoint_path
 local_results_path: "results" # Path for local results
 
+# wandb配置
+use_wandb: false           # 是否使用wandb
+wandb_project: "hier-mcts"     # wandb项目名称
+wandb_entity: ~            # wandb实体（通常是用户名或组织名）
+wandb_notes: ""            # wandb运行说明
+
 # --- RL hyperparameters ---
 gamma: 0.99
 batch_size: 32 # Number of episodes to train on

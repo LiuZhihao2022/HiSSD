@@ -10,6 +10,7 @@ from os.path import dirname, abspath
 import copy
 import json
 import shutil
+import wandb  # 添加wandb导入
 
 from learners.multi_task import REGISTRY as le_REGISTRY
 from runners.multi_task import REGISTRY as r_REGISTRY
@@ -21,7 +22,9 @@ from mctx._src.network import ReplayBufferList
 import numpy as np
 
 from mctx._src.network import PolicyRNN
-
+import logging
+# 设置JAX相关的日志级别为INFO或更高(ERROR, CRITICAL)，这样DEBUG日志就不会显示
+logging.getLogger('jax').setLevel(logging.INFO)
 def run(_run, _config, _log):
     # check args sanity
     _config = args_sanity_check(_config, _log)
@@ -119,7 +122,16 @@ def init_tasks(task_list, main_args, logger):
             "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
             "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
             "avail_actions": {
+                # TODO: 这里如果就是n_actions，会在什么地方出问题吗？
                 "vshape": (env_info["n_actions"],),
+                # "vshape": (task_args.skill_dim,),
+                "group": "agents",
+                "dtype": th.int,
+            },
+            "avail_skills": {
+                # TODO: 这里如果就是n_actions，会在什么地方出问题吗？
+                # "vshape": (env_info["n_actions"],),
+                "vshape": (task_args.skill_dim,),
                 "group": "agents",
                 "dtype": th.int,
             },
@@ -136,6 +148,7 @@ def init_tasks(task_list, main_args, logger):
         groups = {"agents": task_args.n_agents}
         preprocess = {
             "actions": ("actions_onehot", [OneHot(out_dim=task_args.n_actions)])
+            # "actions": ("actions_onehot", [OneHot(out_dim=task_args.skill_dim)]),
         }
 
         task2buffer[task] = ReplayBuffer(
@@ -203,6 +216,7 @@ def train_sequential(
     # with th.no_grad():
     #     for task in main_args.test_tasks:
     #         task2runner[task].t_env = t_env
+    #         # 不知道这里再搞一个test干什么，可能是为了看最开始random的性能为多少？
     #         for _ in range(n_test_runs):
     #             task2runner[task].run(test_mode=True, pretrain=pretrain)
 
@@ -222,7 +236,7 @@ def train_sequential(
     #                 )
 
     # test_time_total += time.time() - test_start_time
-
+    # 这里每一次训练就是一次，t_max其实就是训练了t_max次
     while t_env < t_max:
         # shuffle tasks
         np.random.shuffle(train_tasks)
@@ -263,10 +277,11 @@ def train_sequential(
             test_start_time = time.time()
 
             with th.no_grad():
-                for task in main_args.test_tasks:
-                    task2runner[task].t_env = t_env
-                    for _ in range(n_test_runs):
-                        task2runner[task].run(test_mode=True, pretrain=pretrain)
+                # TODO: 暂时将stage 1的test去掉了，这里后面应该记录一下嘛？
+                # for task in main_args.test_tasks:
+                #     task2runner[task].t_env = t_env
+                #     for _ in range(n_test_runs):
+                #         task2runner[task].run(test_mode=True, pretrain=pretrain)
 
                 # test_pretrain for pretrained tasks
                 if pretrain and test_task2offlinedata is not None:
@@ -287,7 +302,7 @@ def train_sequential(
 
             logger.console_logger.info("Step: {} / {}".format(t_env, t_max))
             logger.console_logger.info(
-                "Estimated time left: {}. Time passed: {}. Test time cost: {}".format(
+                "Estimated time left for stage 1 : {}. Time passed: {}. Test time cost: {}".format(
                     time_left(last_time, last_test_T, t_env, t_max),
                     time_str(time.time() - start_time),
                     time_str(test_time_total),
@@ -338,17 +353,18 @@ def train_online_mcts(
     
     # 初始化MCTS网络和经验回放缓冲区
     mcts_network = None
-    replay_buffer_list = ReplayBufferList(capacity=main_args.replay_buffer_list_capacity//main_args.batch_size if hasattr(main_args, "replay_buffer_list_capacity") else 100)
+    replay_buffer_list = ReplayBufferList(capacity=main_args.replay_buffer_list_capacity//main_args.batch_size if hasattr(main_args, "replay_buffer_list_capacity") else 100, use_real_data=True)
     target_update_interval = main_args.target_update_interval if hasattr(main_args, "target_update_interval") else 20
     
     # 获取一些常用参数
-    # TODO: 这两个参数是干啥的？
     batch_size_run = main_args.batch_size_run
     batch_size_train = main_args.batch_size
-    t_max = t_start + main_args.online_steps
 
-    # 设置测试参数
-    n_test_runs = max(1, main_args.test_nepisode // batch_size_run)
+    # 设置测试参数 - 使用online专用的测试参数
+    test_nepisode_online = main_args.test_nepisode_online if hasattr(main_args, "test_nepisode_online") else main_args.test_nepisode
+    test_interval_online = main_args.test_interval_online if hasattr(main_args, "test_interval_online") else main_args.test_interval
+    
+    n_test_runs = max(1, test_nepisode_online // batch_size_run)
     if main_args.evaluate:
         n_test_runs = 0
     if main_args.debug:
@@ -371,22 +387,29 @@ def train_online_mcts(
             # 从环境信息中获取观察和状态维度
             env_info = mcts_task2runner[task].get_env_info()
             state_shape = env_info["state_shape"]
-            n_actions = env_info["n_actions"]
+            obs_shape = env_info["obs_shape"]
+            # note : n_actions在这里是指技能的数量
+            # n_actions = env_info["n_actions"]
+            n_actions = task2args[task].skill_dim
             n_agents = env_info["n_agents"]
-            
+            input_shape = obs_shape
+            if task2args[task].obs_last_action:
+                input_shape += n_actions
+            if task2args[task].obs_agent_id:
+                input_shape += n_agents
+                
             # 初始化PolicyRNN网络
-            # TODO: 这里的参数怎么给，还需要再确认
             mcts_network = PolicyRNN(
-                obs_input_shape=main_args.obs_process_dim * total_agents,
+                obs_input_shape=input_shape,
                 emb_input_shape=state_shape,
                 output_shape=main_args.skill_dim,
-                # num_agents=total_agents,
                 num_agents=n_agents,
                 device=main_args.device,
                 optimizer='adam',
                 hidden_dim=main_args.hidden_dim if hasattr(main_args, "hidden_dim") else 128,
                 seed=main_args.seed if hasattr(main_args, "seed") else 42
             )
+            mcts_network.init_hidden(batch_size=batch_size_run)
         # 设置runner，传入learner的MAC作为基础策略
         mcts_task2runner[task].setup(
             scheme=task2scheme[task],
@@ -395,10 +418,6 @@ def train_online_mcts(
             mac=mac,
             mcts_network=mcts_network
         )
-        
-            
-            # 设置runner的mcts_network
-            
 
     logger.console_logger.info("Beginning online MCTS training stage...")
     
@@ -407,11 +426,38 @@ def train_online_mcts(
     episode = 0  # 仅用于learner的episode计数
     train_count = 0
 
-    while current_t_env < t_max:
+    # 初始化wandb使用标志
+    use_wandb = main_args.use_wandb if hasattr(main_args, "use_wandb") else False
+    
+    # 添加训练统计跟踪
+    mcts_train_stats = {
+        "loss": [],
+        "policy_loss": [],
+        "value_loss": [],
+    }
+    
+    # 添加测试统计跟踪
+    test_stats = {}
+    for task in test_tasks:
+        test_stats[task] = {"return": [], "win_rates": []}
+
+    # 添加训练任务统计
+    train_task_stats = {}
+    for task in test_tasks:
+        train_task_stats[task] = {"returns": [], "win_rates": [], "lengths": []}
+
+    # 添加窗口平均统计
+    window_size = 20  # 使用相同大小的窗口计算移动平均
+    train_windows = {}
+    for task in test_tasks:
+        train_windows[task] = {"returns": [], "win_rates": []}
+
+    while current_t_env < main_args.online_steps:
         # 收集在线数据
         for task in test_tasks:
             # 使用MCTS收集经验
-            episode_batch, mcts_buffer = mcts_task2runner[task].run(test_mode=False)
+            episode_data = mcts_task2runner[task].run(test_mode=False)
+            episode_batch, mcts_buffer, stats_info = episode_data
             
             # 将收集到的MCTS经验添加到replay_buffer_list
             if mcts_buffer is not None:
@@ -420,69 +466,222 @@ def train_online_mcts(
             # 更新当前的环境步数
             current_t_env = mcts_task2runner[task].t_env
             
-            # 使用收集到的数据仍然更新learner，以保持原来的流程不变
-            # 但实际上我们主要关注的是MCTS网络的训练
-            # 不需要对learner进行巡俩吗
-            # if hasattr(learner, "train_mcts"):
-            #     learner.train_mcts(episode_batch, None, current_t_env, episode, task)
-            # else:
-            #     learner.train(episode_batch, current_t_env, episode, task)
-            
             episode += batch_size_run
+            
+            # 记录训练任务的统计信息
+            episode_return = stats_info["episode_return"]
+            win = stats_info["win"]
+            episode_length = stats_info["episode_length"]
+            
+            # 添加到训练统计
+            train_task_stats[task]["returns"].append(episode_return)
+            train_task_stats[task]["lengths"].append(episode_length)
+            if win is not None:
+                train_task_stats[task]["win_rates"].append(win)
+                
+            # 更新移动窗口数据
+            train_windows[task]["returns"].append(episode_return)
+            if len(train_windows[task]["returns"]) > window_size:
+                train_windows[task]["returns"].pop(0)
+            
+            if win is not None:
+                train_windows[task]["win_rates"].append(win)
+                if len(train_windows[task]["win_rates"]) > window_size:
+                    train_windows[task]["win_rates"].pop(0)
+            
+            # 记录到wandb
+            if use_wandb:
+                # 计算移动平均
+                window_return_avg = np.mean(train_windows[task]["returns"]) if train_windows[task]["returns"] else 0
+                window_win_avg = np.mean(train_windows[task]["win_rates"]) if train_windows[task]["win_rates"] else 0
+                
+                task_stats = {
+                    f"train/{task}/episode_return": episode_return,
+                    f"train/{task}/episode_length": episode_length,
+                    f"train/{task}/window_return_avg": window_return_avg
+                }
+                
+                if win is not None:
+                    task_stats[f"train/{task}/win_rates"] = win
+                    task_stats[f"train/{task}/window_win_avg"] = window_win_avg
+                
+                # 记录其他环境信息
+                for k, v in stats_info.get("stats", {}).items():
+                    if isinstance(v, (int, float)):
+                        task_stats[f"train/{task}/{k}"] = v
+                
+                wandb.log(task_stats, step=current_t_env)
         
         # 训练MCTS网络
-        # TODO: 这里的MCTS网络是如何训练的，还需要再进行一下check
         train_start = time.time()
         if len(replay_buffer_list) >= batch_size_train:
             # 从ReplayBufferList中采样数据
             batch = replay_buffer_list.sample(batch_size_train)
             
             # 训练MCTS网络
-            loss = mcts_network.train_network(
+            loss_dict = mcts_network.train_network(
                 batch=batch,
                 gamma=main_args.gamma if hasattr(main_args, "gamma") else 0.99,
                 value_loss_weight=main_args.value_loss_weight if hasattr(main_args, "value_loss_weight") else 0.5,
                 max_grad_norm=main_args.max_grad_norm if hasattr(main_args, "max_grad_norm") else 10.0,
-                # 在这个代码里应该一直是使用real_data 进行训练的
-                use_real_data=True
+            # 在这个代码里应该一直是使用real_data 进行训练的
+                use_real_data=True,
             )
             
             # 记录训练统计信息
+            loss = loss_dict.get("total_loss", 0.0)
+            policy_loss = loss_dict.get("policy_loss", 0.0)
+            value_loss = loss_dict.get("value_loss", 0.0)
+            
             logger.log_stat("mcts_network_loss", loss, current_t_env)
+            mcts_train_stats["loss"].append(loss)
+            mcts_train_stats["policy_loss"].append(policy_loss)
+            mcts_train_stats["value_loss"].append(value_loss)
+            
+            # 使用wandb记录训练信息
+            if use_wandb:
+                wandb.log({
+                    "mcts/total_loss": loss,
+                    "mcts/policy_loss": policy_loss,
+                    "mcts/value_loss": value_loss,
+                    # "mcts/buffer_size": len(replay_buffer_list),
+                    # "mcts/train_time": time.time() - train_start
+                }, step=current_t_env)
+            
             train_count += 1
             
             # 定期更新目标网络
             if train_count % target_update_interval == 0:
                 mcts_network.update_target_network()
                 logger.console_logger.info(f"Updated MCTS network target at t_env: {current_t_env}")
+                
+            # 定期记录平均损失，记录平均损失后清空mcts_train_stats。这个是只有可以训练的时候才记录，还不能和下面的logger记录相合并
+            if (current_t_env - last_log_T) >= main_args.log_interval:
+                if use_wandb:
+                    # 记录平均损失
+                    wandb.log({
+                        "mcts/avg_loss": np.mean(mcts_train_stats["loss"]),
+                        "mcts/avg_policy_loss": np.mean(mcts_train_stats["policy_loss"]),
+                        "mcts/avg_value_loss": np.mean(mcts_train_stats["value_loss"]),
+                    }, step=current_t_env)
+                
+                # 重置统计信息
+                for k in mcts_train_stats:
+                    mcts_train_stats[k] = []
         
-        
-        # 定期测试
-        if (current_t_env - last_test_T) / main_args.test_interval >= 1 or current_t_env >= t_max:
+        # 定期测试 - 使用online专用的测试间隔
+        if (current_t_env - last_test_T) / test_interval_online >= 1 or current_t_env >= main_args.online_steps:
             test_start_time = time.time()
             
+            # 清空本轮测试统计数据
+            for task in test_tasks:
+                test_stats[task]["returns"] = []
+                test_stats[task]["win_rates"] = []
+                test_stats[task]["lengths"] = []
+            
+            logger.console_logger.info(f"------- Testing at t_env={current_t_env} -------")
+            
             with th.no_grad():
-                for task in main_args.test_tasks:
-                    task2runner[task].t_env = current_t_env
+                for task in test_tasks:
+                    mcts_task2runner[task].t_env = current_t_env
+                    
+                    # 执行测试episode
                     for _ in range(n_test_runs):
-                        task2runner[task].run(test_mode=True)
+                        episode_data = mcts_task2runner[task].run(test_mode=True)
+                        _, _, stats_info = episode_data
+                        
+                        # 收集测试统计信息
+                        test_stats[task]["returns"].append(stats_info["episode_return"])
+                        test_stats[task]["lengths"].append(stats_info["episode_length"])
+                        
+                        if stats_info["win"] is not None:
+                            test_stats[task]["win_rates"].append(stats_info["win"])
+            
+            # 记录测试统计到控制台 - 只显示测试结果
+            logger.console_logger.info("Test Results Summary:")
+            for task in test_tasks:
+                task_mean_test_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+                task_std_test_return = np.std(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+                
+                win_msg = ""
+                if test_stats[task]["win_rates"]:
+                    test_win_rate = np.mean(test_stats[task]["win_rates"])
+                    win_msg = f", Win Rate: {test_win_rate:.3f}"
+                
+                logger.console_logger.info(
+                    f"Task {task} - Return: {task_mean_test_return:.3f} ± {task_std_test_return:.3f}{win_msg}"
+                )
+            
+            # 记录测试统计到wandb - 只记录测试数据
+            if use_wandb:
+                # all_test_returns = []
+                # all_test_wins = []
+                
+                # 只准备测试数据
+                test_data = {}
+                
+                for task in test_tasks:
+                    # 计算测试统计均值
+                    task_mean_test_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+                    task_std_test_return = np.std(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+                    
+                    # 记录测试数据
+                    test_data[f"test/{task}/mean_return"] = task_mean_test_return
+                    test_data[f"test/{task}/std_return"] = task_std_test_return
+                    test_data[f"test/{task}/mean_length"] = np.mean(test_stats[task]["lengths"]) if test_stats[task]["lengths"] else 0
+                    
+                    # 如果有win_rate统计，也记录它
+                    if test_stats[task]["win_rates"]:
+                        test_win_rate = np.mean(test_stats[task]["win_rates"])
+                        test_data[f"test/{task}/win_rates"] = test_win_rate
+                        # all_test_wins.extend(test_stats[task]["win_rates"])
+                    
+                    # all_test_returns.extend(test_stats[task]["returns"])
+                
+                # 记录所有任务的整体测试统计
+                # if all_test_returns:
+                #     test_data["test/overall_mean_return"] = np.mean(all_test_returns)
+                #     test_data["test/overall_std_return"] = np.std(all_test_returns)
+                
+                # if all_test_wins:
+                #     test_data["test/overall_win_rate"] = np.mean(all_test_wins)
+                
+                # 记录测试时间
+                test_data["test/test_time"] = time.time() - test_start_time
+                
+                # 记录测试数据
+                wandb.log(test_data, step=current_t_env)
+                
+                # 添加测试评估标记点
+                wandb.log({"test/evaluation": current_t_env}, step=current_t_env)
+            
+            # 记录测试统计到日志
+            for task in test_tasks:
+                task_mean_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+                logger.log_stat(f"test_return_mean_{task}", task_mean_return, current_t_env)
+                
+                if test_stats[task]["win_rates"]:
+                    win_rate = np.mean(test_stats[task]["win_rates"])
+                    logger.log_stat(f"test_win_rate_{task}", win_rate, current_t_env)
             
             test_time_total += time.time() - test_start_time
             
-            logger.console_logger.info("Online Step: {} / {}".format(current_t_env, t_max))
+            logger.console_logger.info("Online Step: {} / {}".format(current_t_env, main_args.online_steps))
             logger.console_logger.info(
-                "Estimated time left: {}. Time passed: {}. Test time cost: {}".format(
-                    time_left(last_time, last_test_T, current_t_env, t_max),
+                "Estimated time left for state 2 : {}. Time passed: {}. Test time cost: {}".format(
+                    time_left(last_time, last_test_T, current_t_env, main_args.online_steps),
                     time_str(time.time() - start_time),
                     time_str(test_time_total),
                 )
             )
+            logger.console_logger.info("--------------------------------------")
+            
             last_time = time.time()
             last_test_T = current_t_env
         
         # 定期保存模型
         if main_args.save_model and (
-            current_t_env - model_save_time >= main_args.save_model_interval
+            current_t_env - model_save_time >= main_args.save_model_interval_online
             or model_save_time == 0
         ):
             save_path = os.path.join(main_args.online_save_dir, str(current_t_env))
@@ -586,104 +785,98 @@ def run_sequential(args, logger):
         if main_args.evaluate or main_args.save_replay:
             evaluate_sequential(main_args, logger, task2runner)
             return
+    # 我们的代码中没有可以加载的pretrain learner，直接学就行了,不需要用其他任务先pretrain一下
+    if (
+        getattr(main_args, "pretrain", True)
+        and getattr(main_args, "agent") != "mt_odis_ns"
+    ):
+        # initialize training data for each task
+        task2offlinedata = {}
+        for task in main_args.pretrain_tasks:
+            # create offline data buffer
+            task2offlinedata[task] = OfflineBuffer(
+                task,
+                main_args.pretrain_tasks_data_quality[task],
+                data_folder=main_args.offline_data_name,
+                offline_data_size=args.offline_data_size,
+                random_sample=args.offline_data_shuffle,
+            )
 
-    # if (
-    #     getattr(main_args, "pretrain", True)
-    #     and getattr(main_args, "agent") != "mt_odis_ns"
-    # ):
-    #     # initialize training data for each task
-    #     task2offlinedata = {}
-    #     for task in main_args.pretrain_tasks:
-    #         # create offline data buffer
-    #         task2offlinedata[task] = OfflineBuffer(
-    #             task,
-    #             main_args.pretrain_tasks_data_quality[task],
-    #             data_folder=main_args.offline_data_name,
-    #             offline_data_size=args.offline_data_size,
-    #             random_sample=args.offline_data_shuffle,
-    #         )
+        test_task2offlinedata = None
+        # add test data if learner has `test_pretrain` function
+        if hasattr(learner, "test_pretrain") and hasattr(
+            main_args, "test_tasks_data_quality"
+        ):
+            test_task2offlinedata = {}
+            for task in main_args.test_tasks_data_quality.keys():
+                test_task2offlinedata[task] = OfflineBuffer(
+                    task,
+                    main_args.test_tasks_data_quality[task],
+                    data_folder=main_args.offline_data_name,
+                    offline_data_size=args.offline_data_size,
+                    random_sample=args.offline_data_shuffle,
+                )
 
-    #     test_task2offlinedata = None
-    #     # add test data if learner has `test_pretrain` function
-    #     if hasattr(learner, "test_pretrain") and hasattr(
-    #         main_args, "test_tasks_data_quality"
-    #     ):
-    #         test_task2offlinedata = {}
-    #         for task in main_args.test_tasks_data_quality.keys():
-    #             test_task2offlinedata[task] = OfflineBuffer(
-    #                 task,
-    #                 main_args.test_tasks_data_quality[task],
-    #                 data_folder=main_args.offline_data_name,
-    #                 offline_data_size=args.offline_data_size,
-    #                 random_sample=args.offline_data_shuffle,
-    #             )
+        logger.console_logger.info(
+            "Beginning pre-training with {} timesteps for each task".format(
+                main_args.pretrain_steps
+            )
+        )
+        train_sequential(
+            main_args.pretrain_tasks,
+            main_args,
+            logger,
+            learner,
+            task2args,
+            task2runner,
+            task2offlinedata,
+            pretrain=True,
+            test_task2offlinedata=test_task2offlinedata,
+        )
+        logger.console_logger.info(f"Finished pretraining")
+        test_task2offlinedata = None  # free memory
 
-    #     logger.console_logger.info(
-    #         "Beginning pre-training with {} timesteps for each task".format(
-    #             main_args.pretrain_steps
-    #         )
-    #     )
-    #     train_sequential(
-    #         main_args.pretrain_tasks,
-    #         main_args,
-    #         logger,
-    #         learner,
-    #         task2args,
-    #         task2runner,
-    #         task2offlinedata,
-    #         pretrain=True,
-    #         test_task2offlinedata=test_task2offlinedata,
-    #     )
-    #     logger.console_logger.info(f"Finished pretraining")
-    #     test_task2offlinedata = None  # free memory
+        save_path = os.path.join(
+            main_args.pretrain_save_dir, str(main_args.pretrain_steps)
+        )
+        os.makedirs(save_path, exist_ok=True)
+        logger.console_logger.info("Saving models to {}".format(save_path))
+        learner.save_models(save_path)
 
-    #     save_path = os.path.join(
-    #         main_args.pretrain_save_dir, str(main_args.pretrain_steps)
-    #     )
-    #     os.makedirs(save_path, exist_ok=True)
-    #     logger.console_logger.info("Saving models to {}".format(save_path))
-    #     learner.save_models(save_path)
+    # initialize training data for each task
+    task2offlinedata = {}
+    for task in main_args.train_tasks:
+        # create offline data buffer
+        task2offlinedata[task] = OfflineBuffer(
+            task,
+            main_args.train_tasks_data_quality[task],
+            data_folder=main_args.offline_data_name,
+            offline_data_size=args.offline_data_size,
+            random_sample=args.offline_data_shuffle,
+        )
 
-    # elif hasattr(main_args, "pretrain") and getattr(main_args, "agent") != 'mt_model':
-    #     # load models from pretrained model directory
-    #     load_path = os.path.join(main_args.pretrain_save_dir, str(main_args.pretrain_steps))
-    #     learner.load_models(load_path)
-    #     logger.console_logger.info("Load pretrained models from {}".format(load_path))
+    logger.console_logger.info(
+        "Beginning multi-task offline training with {} timesteps for each task".format(
+            main_args.t_max
+        )
+    )
+    # Stage 1 : train each task with offline data
+    train_sequential(
+        main_args.train_tasks,
+        main_args,
+        logger,
+        learner,
+        task2args,
+        task2runner,
+        task2offlinedata,
+    )
 
-    # # initialize training data for each task
-    # task2offlinedata = {}
-    # for task in main_args.train_tasks:
-    #     # create offline data buffer
-    #     task2offlinedata[task] = OfflineBuffer(
-    #         task,
-    #         main_args.train_tasks_data_quality[task],
-    #         data_folder=main_args.offline_data_name,
-    #         offline_data_size=args.offline_data_size,
-    #         random_sample=args.offline_data_shuffle,
-    #     )
-
-    # logger.console_logger.info(
-    #     "Beginning multi-task offline training with {} timesteps for each task".format(
-    #         main_args.t_max
-    #     )
-    # )
-    # # Stage 1 : train each task with offline data
-    # train_sequential(
-    #     main_args.train_tasks,
-    #     main_args,
-    #     logger,
-    #     learner,
-    #     task2args,
-    #     task2runner,
-    #     task2offlinedata,
-    # )
-
-    # # save the final model
-    # if main_args.save_model:
-    #     save_path = os.path.join(main_args.save_dir, str(main_args.t_max))
-    #     os.makedirs(save_path, exist_ok=True)
-    #     logger.console_logger.info("Saving final models to {}".format(save_path))
-    #     learner.save_models(save_path)
+    # save the final model
+    if main_args.save_model:
+        save_path = os.path.join(main_args.save_dir, str(main_args.t_max))
+        os.makedirs(save_path, exist_ok=True)
+        logger.console_logger.info("Saving final models to {}".format(save_path))
+        learner.save_models(save_path)
 
     # Stage 2 : online training with hierarchical ma gumbel muzero
     if getattr(main_args, "use_online_mcts", False):
@@ -706,7 +899,7 @@ def run_sequential(args, logger):
             task2scheme,
             task2groups,
             task2preprocess,
-            t_start=main_args.t_max
+            t_start=0
         )
     else:
         # 如果不使用在线MCTS，关闭环境

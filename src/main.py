@@ -11,12 +11,16 @@ import sys
 import torch as th
 from utils.logging import get_logger
 import yaml
+import wandb  # 添加wandb导入
 
 # import run program
 from run import run as run
 from mto import run as mto
-
+from hier_mcts import run as hier_mcts_run
 SETTINGS['CAPTURE_MODE'] = "fd" # set to "no" if you want to see stdout/stderr in console
+
+os.environ["WANDB_MODE"] = "offline"
+
 logger = get_logger()
 
 ex = Experiment("MOCO")
@@ -33,12 +37,33 @@ def my_main(_run, _config, _log):
     np.random.seed(config["seed"])
     th.manual_seed(config["seed"])
     config['env_args']['seed'] = config["seed"]
+    
+    # 初始化wandb
+    if config.get("use_wandb", False):
+        wandb_config = {
+            "project": config.get("wandb_project", "HiSSD"),
+            "entity": config.get("wandb_entity", None),
+            "notes": config.get("wandb_notes", ""),
+            "name": f"{config['name']}{config['remark']}_{config['env']}_{config['task']}",
+            "config": config,
+            "dir": config['results_save_dir'],
+            "job_type": "train",
+        }
+        wandb.init(**wandb_config)
+        # 将wandb run ID添加到sacred的info中
+        _run.info["wandb_run_id"] = wandb.run.id
 
     # run the framework
     if config['run_file'].startswith('mto'):
         mto(_run, config, _log)
+    elif config['run_file'].startswith('hier'):
+        hier_mcts_run(_run, config, _log)
     else:
         run(_run, config, _log)
+    
+    # 关闭wandb
+    if config.get("use_wandb", False):
+        wandb.finish()
 
 
 def _get_config(params, arg_name, subfolder):
@@ -148,6 +173,15 @@ if __name__ == '__main__':
             results_path = os.path.join(results_path, 'evaluate')
         results_save_dir = os.path.join(
             results_path, "mto", config_dict['env'], config_dict['task'],
+            '+'.join([f'{k}-{v}' for k, v in config_dict['train_tasks_data_quality'].items()]),
+            config_dict['name'] + config_dict['remark'],
+            unique_token
+        )
+    elif config_dict['run_file'].startswith('hier'):
+        if config_dict['evaluate']:
+            results_path = os.path.join(results_path, 'evaluate')
+        results_save_dir = os.path.join(
+            results_path, "hier_mcts", config_dict['env'], config_dict['task'],
             '+'.join([f'{k}-{v}' for k, v in config_dict['train_tasks_data_quality'].items()]),
             config_dict['name'] + config_dict['remark'],
             unique_token

@@ -5,7 +5,7 @@ from typing import Tuple, Any
 import mctx
 from mctx._src.network import PolicyValueNetwork, compute_prior_from_qvalues
 from mctx._src.simple_env import SimpleEnv, MultiAgentSimpleEnv
-from mctx._src.utils import stochastic_top_k_sampling
+from mctx._src.utils import stochastic_top_k_sampling, compute_offline_value_weight
 from mctx._src.network import PolicyRNN
 
 class EnvironmentWrapper:
@@ -144,38 +144,44 @@ class WorldModelEnv:
         return next_obs, next_state, reward.item(), False, {}
 
 # 注意：这个num_agents, 是实际需要选择skill的agents。在目前的sc2实现中，是agent+enemy
-def make_recurrent_fn_world_model(mac, batch_size: int, model, temperature: float, num_agents: int, k: int):
+def make_recurrent_fn_world_model(mac, batch_size: int, model, temperature: float, num_agents: int, k: int, 
+                                 offline_value_start: float = 1.0, 
+                                 offline_value_end: float = 0.2, 
+                                 offline_value_anneal_time: int = 500000):
     """
     创建使用世界模型的递归函数，用于MCTS搜索
     
     Args:
-        envs: 世界模型环境列表
+        mac: 多智能体控制器
         batch_size: 批大小
         model: 策略值网络模型
         temperature: 温度参数，用于探索
         num_agents: 智能体数量
         k: 采样的动作数量
+        offline_value_start: offline value权重的初始值
+        offline_value_end: offline value权重的最终值
+        offline_value_anneal_time: 权重从初始值衰减到最终值所需的步骤数
         
     Returns:
         recurrent_fn: MCTS使用的递归函数
     """
     
-    def recurrent_fn(params, rng_key, actions, last_actions, embeddings, policy_hidden_states, critic_hidden_states, wm_hidden_states, task):
+    def recurrent_fn(params, rng_key, actions, observations, states, policy_hidden_states, critic_hidden_states, wm_hidden_states, task, t_step):
         del params, rng_key
         
         actions = np.array(actions)
-        bs = embeddings.shape[0]
+        bs = observations.shape[0]
 
-        observations ,next_states, rewards, values, new_wm_hidden_states = mac.world_model_predict(embeddings, last_actions, actions, wm_hidden_states, task)
+        next_observations ,next_states, rewards, wm_value, new_wm_hidden_states = mac.world_model_predict(observations, states, actions, wm_hidden_states, task)
         discounts = np.ones(bs)  # Assuming discount factor of 1.0 for all agents
 
         
         # 使用stochastic_top_k_sampling获取动作
         batched_sampled_queues, new_policy_hidden_states = stochastic_top_k_sampling(
-            num_agents, model, observations, policy_hidden_states, model.num_actions, k
+            num_agents, model, next_observations, policy_hidden_states, model.num_actions, k
         )
         new_policy_hidden_states = new_policy_hidden_states.detach().cpu().numpy()
-        new_wm_hidden_states = new_wm_hidden_states.detach().cpu().numpy()
+        
         # 提取采样的动作和先验概率
         sampled_actions = [[action for action, _, _ in batch] for batch in batched_sampled_queues]
         prior_logits = [[log_prob for _, log_prob, _ in batch] for batch in batched_sampled_queues]
@@ -184,10 +190,12 @@ def make_recurrent_fn_world_model(mac, batch_size: int, model, temperature: floa
         
         # 预测价值
         value, new_critic_hidden_states = model.predict_value(next_states, critic_hidden_states)
-        # TODO: 暂时将value和values进行平均。后面可能更改为随着时间的推移进行更新
-        # TODO: check shape
-        value = (value + values)/2
         value = value.detach().cpu().numpy().flatten()
+        
+        # 使用offline_value_weight来加权平均
+        offline_value_weight = compute_offline_value_weight(t_step, offline_value_start, offline_value_end, offline_value_anneal_time)
+        value = (1 - offline_value_weight) * value + offline_value_weight * wm_value
+        
         new_critic_hidden_states = new_critic_hidden_states.detach().cpu().numpy()
         
         # 返回MCTS所需的输出
@@ -201,6 +209,6 @@ def make_recurrent_fn_world_model(mac, batch_size: int, model, temperature: floa
             sampled_actions=sampled_actions,
             wm_hidden_states=new_wm_hidden_states,
         )
-        return recurrent_fn_output, next_states, observations
+        return recurrent_fn_output, next_states, next_observations
         
     return recurrent_fn

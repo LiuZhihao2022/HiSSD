@@ -4,13 +4,12 @@ from sre_compile import dis
 
 from numpy import log
 from components.episode_buffer import EpisodeBatch
-from modules.mixers.multi_task.vdn import VDNMixer
-from modules.mixers.qmix import QMixer
-from modules.mixers.multi_task.qattn import QMixer as MTAttnQMixer
+# 移除mixer导入
 import torch as th
 from torch.optim import RMSprop, Adam, AdamW
 import torch.nn.functional as F
 import math
+import wandb  # 添加wandb导入
 
 import os
 
@@ -20,27 +19,23 @@ class HISSDLearner:
         self.main_args = main_args
         self.mac = mac
         self.logger = logger
+        self.use_wandb = main_args.use_wandb if hasattr(main_args, "use_wandb") else False
 
-        # get some attributes from mac
+        # 获取一些属性从mac
         self.task2args = mac.task2args
         self.task2n_agents = mac.task2n_agents
         self.surrogate_decomposer = mac.surrogate_decomposer
         self.task2decomposer = mac.task2decomposer
+        
+        # 使用mac中的mixer而不是在这里初始化
+        self.mixer = mac.mixer
+        self.target_mixer = mac.target_mixer
 
         self.params = list(mac.parameters())
+        if self.mixer is not None:
+            self.params += list(self.mixer.parameters())
 
         self.last_target_update_episode = 0
-
-        self.mixer = None
-        if main_args.mixer is not None:
-            if main_args.mixer == "vdn":
-                self.mixer = VDNMixer()
-            elif main_args.mixer == "mt_qattn":
-                self.mixer = MTAttnQMixer(self.surrogate_decomposer, main_args)
-            else:
-                raise ValueError(f"Mixer {main_args.mixer} not recognised.")
-            self.params += list(self.mixer.parameters())
-            self.target_mixer = copy.deepcopy(self.mixer)
 
         self._reset_optimizer()
 
@@ -195,22 +190,27 @@ class HISSDLearner:
         mask = batch["filled"][:, :].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
-
         dec_loss = 0.0
         b, t, n = actions.shape[0], actions.shape[1], actions.shape[2]
         self.mac.init_hidden(batch.batch_size, task)
         t = 0
         while t < batch.max_seq_length - self.c: # TODO:这里留出了接口，一次planner的技能选择可以指导c_time次底层动作选择. 是从skill重建动作，与原动作进行比对
             act_outs = []   # forward_planner的作用是提取skill，计算技能表示，forward_planner_feedforward的作用是根据技能表示计算特定任务的特征(action or value)
+            agent_inputs = self.mac._build_inputs(batch, t=t, task=task)
             agent_outs, _, _ = self.mac.forward_planner(
                 batch, t=t, task=task, actions=actions[:, t], hrl=True, skill_index_out=False
             )
-            act_agent_outs = self.mac.forward_planner_feedforward(agent_outs)
+            act_agent_outs = self.mac.forward_planner_feedforward(agent_outs, additional_input=agent_inputs, forward_type="action", task=task)
             
             for i in range(self.c):# 提取当前环境状态的关键特征,作为判别器，区分不同状态和任务的特征
-                _, discr_h = self.mac.forward_discriminator(batch, t=t + i, task=task)
-                act_out, _ = self.mac.forward_global_action(
-                    batch, act_agent_outs, discr_h, t + i, task
+                # single task setting下，已经不需要forward_discriminator了
+                # _, discr_h = self.mac.forward_discriminator(batch, t=t + i, task=task)
+                # act_out, _ = self.mac.forward_global_action(
+                #     batch, act_agent_outs, discr_h, t + i, task
+                # )
+                act_out = self.mac.forward_global_action(
+                    # batch, act_agent_outs, discr_h, t + i, task
+                    batch, act_agent_outs, None, t + i, task
                 )
                 act_outs.append(act_out)
             act_outs = th.stack(act_outs, dim=1)
@@ -316,12 +316,20 @@ class HISSDLearner:
 
         else:
             ssl_loss = th.tensor(0.0)
-        
+        # vae_loss实际上就是另一种形式的dec_loss. 所以只在planner中记录dec_loss就行了
         vae_loss = dec_loss / (batch.max_seq_length - self.c)
         # 移除了奖励预测部分，现在在train_planner中进行
         loss = vae_loss
         if ssl_loss is not None:
             loss += self.beta * ssl_loss
+        # TODO: 这些记录是不是可以放到最外面的run_sequential里去？
+        # 在函数末尾添加wandb记录
+        # if self.use_wandb:
+        #     wandb.log({
+        #         f"{task}/vae_loss": vae_loss.item(),
+        #         f"{task}/dec_loss": dec_loss.item(),
+        #         f"{task}/ssl_loss": ssl_loss.item() if ssl_loss is not None else 0.0
+        #     }, step=t_env)
 
         loss.backward()
 
@@ -354,6 +362,10 @@ class HISSDLearner:
 
         vae_loss = dec_loss / (batch.max_seq_length - self.c)
         loss = vae_loss
+
+        # 添加wandb记录
+        # if self.use_wandb:
+        #     wandb.log({f"{task}/test_vae_loss": loss.item()}, step=t_env)
 
         self.logger.log_stat(f"train/{task}/test_vae_loss", loss.item(), t_env)
     # 使用value-based的方法训练MARL的值函数
@@ -394,7 +406,7 @@ class HISSDLearner:
             mixed_values = values.sum(dim=2)
             target_mixed_values = target_values.sum(dim=2).detach()
 
-        cs_rewards = batch["reward"]
+        cs_rewards = batch["reward"].clone()
         discount = self.main_args.gamma
         for i in range(1, self.c):
             cs_rewards[:, : -self.c] += discount * rewards[:, i : -(self.c - i)]
@@ -422,6 +434,11 @@ class HISSDLearner:
             )
 
         loss = value_loss
+
+        # 添加wandb记录
+        # 都只在train_planner中记录
+        # if self.use_wandb:
+        #     wandb.log({f"{task}/value_loss": value_loss.item()}, step=t_env)
 
         self.mac.agent.value.requires_grad_(True)
         loss.backward()
@@ -452,7 +469,6 @@ class HISSDLearner:
         planner_loss = 0.0
         reward_pred_loss = 0.0  # 添加奖励预测损失
         b, t, n = actions.shape[0], actions.shape[1], actions.shape[2]
-
         self.mac.init_hidden(batch.batch_size, task)
         self.target_mac.init_hidden(batch.batch_size, task)
         for t in range(batch.max_seq_length - self.c):
@@ -465,14 +481,15 @@ class HISSDLearner:
                 loss_out=True,
             )
             # 预测值函数
+            agent_inputs = self.mac._build_inputs(batch, t=t, task=task)
             value_out_h = self.mac.forward_planner_feedforward(
-                out_h, forward_type="value"
+                out_h, additional_input=agent_inputs, forward_type="value", task=task
             )
             mac_value.append(value_out_h)
             
             # 添加奖励预测部分
             reward_out_h = self.mac.forward_planner_feedforward(
-                out_h, forward_type="reward"
+                out_h, additional_input=agent_inputs, forward_type="reward", task=task
             )
             mac_reward.append(reward_out_h)
             # 获取实际奖励            
@@ -483,11 +500,12 @@ class HISSDLearner:
             out_h, _, _ = self.mac.forward_planner(
                 batch, t=t + i, task=task, actions=actions[:, t + i]
             )
+            agent_inputs = self.mac._build_inputs(batch, t=t + i, task=task)
             value_out_h = self.mac.forward_planner_feedforward(
-                out_h, forward_type="value"
+                out_h, additional_input=agent_inputs, forward_type="value", task=task
             )
             reward_out_h = self.mac.forward_planner_feedforward(
-                out_h, forward_type="reward"
+                out_h, additional_input=agent_inputs, forward_type="reward", task=task
             )
             mac_reward.append(reward_out_h)
             mac_value.append(value_out_h)
@@ -526,7 +544,7 @@ class HISSDLearner:
             mixed_values = value_pre.sum(dim=2)
             target_mixed_values = target_value_pre.sum().detach()
 
-        cs_rewards = batch["reward"]
+        cs_rewards = batch["reward"].clone()
         discount = self.main_args.gamma
         for i in range(1, self.c):
             cs_rewards[:, : -self.c] += discount * rewards[:, i : -(self.c - i)]
@@ -570,8 +588,24 @@ class HISSDLearner:
             self.logger.log_stat(f"{task}/dec_loss", dec_loss.item(), t_env)
             self.logger.log_stat(f"{task}/value_loss", v_loss.item(), t_env)
             self.logger.log_stat(f"{task}/plan_loss", planner_loss.item(), t_env)
-            self.logger.log_stat(f"{task}/ssl_loss", ssl_loss.item(), t_env)
+            # self.logger.log_stat(f"{task}/ssl_loss", ssl_loss.item(), t_env)
             self.logger.log_stat(f"{task}/reward_pred_loss", reward_pred_loss.item(), t_env)
+            self.task2train_info[task]["log_stats_t"] = t_env
+
+        # 在函数末尾添加wandb记录
+        # TODO: 这里怎么不更新self.task2train_info[task]["log_stats_t"]?那不是每次都要记录了吗?
+        if self.use_wandb:
+            wandb.log({
+                f"{task}/dec_loss": dec_loss.item() if dec_loss is not None else 0.0,
+                f"{task}/value_loss": v_loss.item() if v_loss is not None else 0.0,
+                # planner_loss就是TD-error加权过后的obs_loss
+                f"{task}/plan_loss": planner_loss.item(),
+                # f"{task}/ssl_loss": ssl_loss.item() if ssl_loss is not None else 0.0,
+                f"{task}/reward_pred_loss": reward_pred_loss.item(),
+                # f"{task}/td_error": td_error.item() if not self.adaptation else 0.0,
+                # f"{task}/weight": weight.mean().item() if not self.adaptation else 0.0
+            }, step=t_env)
+
     # 这个函数是用来训练SSL的，主要是对比损失函数，但在这个代码中没用到
     def train_ssl(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         # Get the relevant quantities
@@ -613,6 +647,10 @@ class HISSDLearner:
                 cur_out, pos_out.detach(), target_outs.detach()
             )
         ssl_loss = ssl_loss / cur_out.shape[0]
+
+        # 添加wandb记录
+        # if self.use_wandb:
+        #     wandb.log({f"{task}/ssl_loss": ssl_loss.item()}, step=t_env)
 
         ssl_loss.backward()
 
@@ -657,15 +695,15 @@ class HISSDLearner:
                 ssl_loss=th.tensor(0.0),
             )
         else:
-            dec_loss = 0
-            ssl_loss = 0
-            v_loss = 0
+            # dec_loss = 0
+            # ssl_loss = 0
+            # v_loss = 0
             # TODO: 这里记得修改回来
-            # dec_loss, ssl_loss, reward_pred_loss = self.train_vae(batch, t_env, episode_num, task)
-            # self.update_last_batch(task, batch)
-            # self.update(pretrain=False)
-            # v_loss = self.train_value(batch, t_env, episode_num, task)
-            # self.update(pretrain=False)
+            dec_loss, ssl_loss = self.train_vae(batch, t_env, episode_num, task)
+            self.update_last_batch(task, batch)
+            self.update(pretrain=False)
+            v_loss = self.train_value(batch, t_env, episode_num, task)
+            self.update(pretrain=False)
 
             self.train_planner(
                 batch,
@@ -692,22 +730,14 @@ class HISSDLearner:
             self.target_mixer.cuda()
 
     def save_models(self, path):
+        """保存模型，mixer现在在mac中保存"""
         self.mac.save_models(path)
-        if self.mixer is not None:
-            th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
         th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
 
     def load_models(self, path):
         self.mac.load_models(path)
         # Not quite right but I don't want to save target networks
         self.target_mac.load_models(path)
-        if self.mixer is not None:
-            self.mixer.load_state_dict(
-                th.load(
-                    "{}/mixer.th".format(path),
-                    map_location=lambda storage, loc: storage,
-                )
-            )
         self.optimiser.load_state_dict(
             th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage)
         )

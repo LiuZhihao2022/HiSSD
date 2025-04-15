@@ -38,6 +38,9 @@ def search(
     root_action_selection_fn: base.RootActionSelectionFn,
     interior_action_selection_fn: base.InteriorActionSelectionFn,
     num_simulations: int,
+    task: str,
+    current_t_env: int,
+    args,
     max_depth: Optional[int] = None,
     invalid_actions: Optional[np.ndarray] = None,
     extra_data: Any = None,
@@ -108,7 +111,7 @@ def search(
     
     # Expand timing
     expand_start = time.time()
-    tree = expand(params, tree, recurrent_fn, parent_index, action, next_node_index)
+    tree = expand(params, tree, recurrent_fn, parent_index, action, next_node_index, task, current_t_env)
     timing_stats['expand_time'] += time.time() - expand_start
     
     # Backward timing
@@ -199,7 +202,9 @@ def expand(
     recurrent_fn: base.RecurrentFn,
     parent_index: np.ndarray,
     action: np.ndarray,
-    next_node_index: np.ndarray) -> Tree[T]:
+    next_node_index: np.ndarray,
+    task: str,
+    current_t_env: int) -> Tree[T]:
   """Create and evaluate child nodes from given nodes and unvisited actions.
 
   Args:
@@ -224,24 +229,54 @@ def expand(
   batch_range = np.arange(batch_size)
   parent_index = np.array(parent_index)
   action = np.array(action)
+  # TODO: 能否通过这个函数直接得到last_action?
   corresponding_joint_action = jax.vmap(extract_actions, in_axes=(0, 0, 0))(tree.sampled_actions, action, parent_index)
   chex.assert_shape([parent_index, action, next_node_index], (batch_size,))
-  embedding = jax.tree_util.tree_map(
+  state = jax.tree_util.tree_map(
       lambda x: x[batch_range, parent_index], tree.embeddings)
 
   observation = jax.tree_util.tree_map(
-      lambda x: x[batch_range, :, parent_index], tree.observations)
+      lambda x: x[batch_range, parent_index], tree.observations)
 
   policy_hidden_states = jax.tree_util.tree_map(
       lambda x: x[batch_range, parent_index], tree.policy_hidden_states)
   critic_hidden_states = jax.tree_util.tree_map(
       lambda x: x[batch_range, parent_index], tree.critic_hidden_states)
+  wm_hidden_states = jax.tree_util.tree_map(
+      lambda x: x[batch_range, parent_index], tree.wm_hidden_states)
+
+  # # 获取父节点的父节点索引
+  # parent_parent_index = jax.tree_util.tree_map(
+  #     lambda x: x[batch_range, parent_index], tree.parents)
   
-  embedding = np.array(embedding)
+  # # 获取父节点的动作
+  # action_from_parent_parent = jax.tree_util.tree_map(
+  #     lambda x: x[batch_range, parent_index], tree.action_from_parent)
+
+  # # 获取sampled_actions
+  # sampled_actions = jax.tree_util.tree_map(
+  #     lambda x: x[batch_range, parent_parent_index], tree.sampled_actions)
+  
+  # n_agents = sampled_actions.shape[-1]
+
+  # # 如果 action_from_parent 的形状为 (1,)，则将其转换为 (1, 1)
+  # if action_from_parent_parent.ndim == 1:
+  #   action_from_parent_parent = np.expand_dims(action_from_parent_parent, axis=1)  # [bs, n]
+
+  # # 创建掩码，处理action_from_parent_parent中的-1
+  # # 对于action_from_parent_parent中的-1处理，创建掩码
+  # invalid_mask = (action_from_parent_parent == -1)
+  # extended_sampled_actions = np.concatenate([sampled_actions, np.full((batch_size, 1, n_agents), -1)], axis=1)
+  # # 使用 np.take_along_axis 来按照第二维进行索引
+  # # 通过 action_from_parent_parent 作为索引选择对应的 sampled_actions
+  # indexed_actions = np.take_along_axis(extended_sampled_actions, action_from_parent_parent[..., None], axis=1)
+
+  state = np.array(state)
   observation = np.array(observation)
   policy_hidden_states = np.array(policy_hidden_states)
   critic_hidden_states = np.array(critic_hidden_states)
-  step, next_embedding, next_observation = recurrent_fn(params, None, corresponding_joint_action, embedding, policy_hidden_states, critic_hidden_states)
+  # step, next_embedding, next_observation = recurrent_fn(params, None, corresponding_joint_action, indexed_actions, observation, policy_hidden_states, critic_hidden_states, wm_hidden_states, task)
+  step, next_embedding, next_observation = recurrent_fn(params, None, corresponding_joint_action, observation, state, policy_hidden_states, critic_hidden_states, wm_hidden_states, task, current_t_env)
   # TODO: 这里解包后还需要改改
   chex.assert_shape(step.prior_logits, [batch_size, tree.num_actions])
   chex.assert_shape(step.reward, [batch_size])

@@ -92,6 +92,7 @@ class NearestEmbedFunc(torch.autograd.Function):
         # find nearest neighbors
         dist = torch.norm(x_expanded - emb_expanded, 2, 1)
         _, argmin = dist.min(-1)
+        # 虽然skill是竖着的，但是这里把竖着的skill已经变成横着的了，所以后面就当横着的处理就可以
         shifted_shape = [input.shape[0], *
                          list(input.shape[2:]), input.shape[1]]
         result = emb.t().index_select(0, argmin.view(-1)

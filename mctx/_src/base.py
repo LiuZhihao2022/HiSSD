@@ -115,6 +115,7 @@ class PolicyOutput(Generic[T]):
   search_tree: `[B, ...]` the search tree of the finished search.
   """
   action: chex.Array
+  chosen_skill: chex.Array
   action_weights: chex.Array
   search_tree: tree.Tree[T]
 
