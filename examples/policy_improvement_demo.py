@@ -70,7 +70,7 @@ class DemoOutput:
   selected_action_value: chex.Array
   action_weights_policy_value: chex.Array
 
-def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=FLAGS.num_agents, num_actions=FLAGS.num_actions, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None) -> mctx.RootFnOutput:
+def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=FLAGS.num_agents, num_actions=FLAGS.num_actions, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None, bs_id = None) -> mctx.RootFnOutput:
     """
     Initializes the root node for the MCTS (Monte Carlo Tree Search) process.
 
@@ -96,7 +96,7 @@ def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=F
             wm_hidden_states = np.array(wm_hidden_states)
     if policy_hidden_states is None or critic_hidden_states is None:
         # policy_hidden_states, critic_hidden_states = network.init_hidden(batch_size= batch_size)
-        policy_hidden_states, critic_hidden_states = network.get_hidden_states()
+        policy_hidden_states, critic_hidden_states = network.get_hidden_states(bs_id)
 
     # 使用stochastic_top_k_sampling选取动作
     batched_sampled_queues_with_reference, new_policy_hidden_states = stochastic_top_k_sampling(

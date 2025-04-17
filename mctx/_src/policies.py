@@ -204,7 +204,13 @@ def gumbel_muzero_policy(
   batch_range = np.arange(batch_size)
   chosen_skill = jax.tree_util.tree_map(
       lambda x: x[batch_range, search_tree.ROOT_INDEX, action], search_tree.sampled_actions)
-  # chosen_skill = search_tree.sampled_actions[batch_range, search_tree.ROOT_INDEX, action]
+
+  # 新增：根据action找到对应的子节点索引，并返回该子节点的wm_hidden_state
+  # children_index: [B, N, num_actions]，N=节点数，ROOT_INDEX=0
+  child_indices = search_tree.children_index[batch_range, search_tree.ROOT_INDEX, action]  # [B]
+  # wm_hidden_states: [B, N, ...]
+  new_wm_hidden_states = search_tree.wm_hidden_states[batch_range, child_indices]
+
   # Producing action_weights usable to train the policy network.
   completed_search_logits = _mask_invalid_actions(
       root.prior_logits + completed_qvalues, invalid_actions)
@@ -214,7 +220,7 @@ def gumbel_muzero_policy(
       action=action,
       chosen_skill = chosen_skill,
       action_weights=action_weights,
-      search_tree=search_tree), timing_stats, advantages
+      search_tree=search_tree), timing_stats, advantages, new_wm_hidden_states
 
 
 def stochastic_muzero_policy(

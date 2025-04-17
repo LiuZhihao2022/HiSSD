@@ -124,6 +124,37 @@ class Tree(Generic[T]):
         value=value,
         qvalues=qvalues)
 
+  def get_single_batch(self, batch_idx: int) -> "Tree":
+    """返回只包含单个batch数据的新Tree对象。"""
+    # 只取batch_idx对应的那一行/切片
+    def _slice(x):
+      if isinstance(x, np.ndarray) or (hasattr(x, 'shape') and hasattr(x, '__getitem__')):
+        if x.shape[0] == self.node_values.shape[0]:
+          return x[batch_idx:batch_idx+1]
+        return x
+      return x
+    return Tree(
+      node_visits=_slice(self.node_visits),
+      raw_values=_slice(self.raw_values),
+      node_values=_slice(self.node_values),
+      parents=_slice(self.parents),
+      action_from_parent=_slice(self.action_from_parent),
+      children_index=_slice(self.children_index),
+      children_prior_logits=_slice(self.children_prior_logits),
+      children_visits=_slice(self.children_visits),
+      children_rewards=_slice(self.children_rewards),
+      children_discounts=_slice(self.children_discounts),
+      children_values=_slice(self.children_values),
+      embeddings=_slice(self.embeddings),
+      observations=_slice(self.observations),
+      sampled_actions=_slice(self.sampled_actions),
+      root_invalid_actions=_slice(self.root_invalid_actions),
+      extra_data=_slice(self.extra_data),
+      policy_hidden_states=_slice(self.policy_hidden_states),
+      critic_hidden_states=_slice(self.critic_hidden_states),
+      wm_hidden_states=_slice(self.wm_hidden_states),
+    )
+
 
 def infer_batch_size(tree: Tree) -> int:
   """Recovers batch size from `Tree` data structure."""

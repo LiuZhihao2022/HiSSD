@@ -19,7 +19,8 @@ from mctx._src.recurrent_fn import make_recurrent_fn_gym, make_recurrent_fn_worl
 # from mctx._src.utils import convert_tree_to_graph, stochastic_top_k_sampling
 from mctx._src.utils import stochastic_top_k_sampling
 from examples.policy_improvement_demo import initialize_root, DemoOutput
-
+import torch.nn.functional as F
+import torch
 class HierMCTSEpisodeRunner:
 
     def __init__(self, args, logger, task):
@@ -160,7 +161,7 @@ class HierMCTSEpisodeRunner:
             
             current_state = self.batch["state"][:, self.t]
             # current_obs = self.batch["obs"][:, self.t]
-            current_input = self.mac._build_inputs(self.batch, t=self.t, task=self.task).reshape(self.batch_size, self.n_agents, -1)
+            current_input = self.mac._build_inputs(self.batch, t=self.t, task=self.task, use_skill=True).reshape(self.batch_size, self.n_agents, -1)
             
             if self.t % self.c_step == 0:
                 # 存储上一个周期的MCTS数据（如果有）
@@ -178,6 +179,8 @@ class HierMCTSEpisodeRunner:
                         real_next_state=current_state,
                         real_done=np.zeros(self.batch_size, dtype=bool)  # 中间步骤不是终止状态
                     )
+                    skills_onehot = {"skills_onehot": F.one_hot(torch.LongTensor(np.array(self.current_skill_index)), num_classes=self.args.skill_dim)}
+                    self.batch.update(skills_onehot, ts=self.last_skill_selection_t)
                     self.accumulated_reward = 0
                 
                 # 使用MCTS选择一个skill
@@ -219,6 +222,7 @@ class HierMCTSEpisodeRunner:
                 "actions": chosen_actions,
                 "reward": [(reward,)],
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
+                "actions_onehot": F.one_hot(chosen_actions, num_classes=self.args.n_actions)
             }
 
             self.batch.update(post_transition_data, ts=self.t)
@@ -241,7 +245,7 @@ class HierMCTSEpisodeRunner:
             
             final_state = self.batch["state"][:, self.t]
             # final_obs = self.batch["obs"][:, self.t]
-            final_input = self.mac._build_inputs(self.batch,t=self.t,task=self.task).reshape(self.batch_size, self.n_agents, -1)
+            final_input = self.mac._build_inputs(self.batch,t=self.t,task=self.task, use_skill=True).reshape(self.batch_size, self.n_agents, -1)
             
             policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state = self.current_mcts_data
             self.replay_buffer_mcts.push(
@@ -327,7 +331,7 @@ class HierMCTSEpisodeRunner:
         # observation = batch_obs.reshape(self.batch_size, self.n_agents, -1)
         # TODO: 这里要区分一下是不是real data，只有不是的时候才需要处理. 不过暂时都处理了
         # TODO: 输出的shape是什么意思？能不能直接用来做embedding？
-        obs_inputs = self.mac.preprocess_obs(self.batch, self.t, self.task).cpu().numpy()
+        obs_inputs = self.mac.preprocess_obs(self.batch, self.t, self.task, use_skill=True).cpu().numpy()
         # 初始化根节点
         root, experienced_thresholds, root_policy_hidden_state, root_critic_hidden_state = initialize_root(
             self.mcts_network, 
@@ -343,7 +347,7 @@ class HierMCTSEpisodeRunner:
         )
         
         # 运行MCTS搜索
-        policy_output, timing_stats, advantages = mctx.gumbel_muzero_policy(
+        policy_output, timing_stats, advantages,new_wm_hidden_states = mctx.gumbel_muzero_policy(
             params=(),
             rng_key=np.random.RandomState(),
             root=root,
@@ -376,7 +380,7 @@ class HierMCTSEpisodeRunner:
         if hasattr(policy_output, "estimated_value"):
             self.mcts_stats["mcts_values"].append(policy_output.estimated_value)
         
-        return policy_output.chosen_skill, policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state
+        return policy_output.chosen_skill, (policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state), new_wm_hidden_states
 
     def _log(self, returns, stats, prefix):
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)

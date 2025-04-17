@@ -481,7 +481,8 @@ class HISSDLearner:
                 loss_out=True,
             )
             # 预测值函数
-            agent_inputs = self.mac._build_inputs(batch, t=t, task=task)
+            # agent_inputs = self.mac._build_inputs(batch, t=t, task=task)
+            agent_inputs = batch["state"][:, t]
             value_out_h = self.mac.forward_planner_feedforward(
                 out_h, additional_input=agent_inputs, forward_type="value", task=task
             )
@@ -500,7 +501,8 @@ class HISSDLearner:
             out_h, _, _ = self.mac.forward_planner(
                 batch, t=t + i, task=task, actions=actions[:, t + i]
             )
-            agent_inputs = self.mac._build_inputs(batch, t=t + i, task=task)
+            # agent_inputs = self.mac._build_inputs(batch, t=t + i, task=task)
+            agent_inputs = batch["state"][:, t]
             value_out_h = self.mac.forward_planner_feedforward(
                 out_h, additional_input=agent_inputs, forward_type="value", task=task
             )

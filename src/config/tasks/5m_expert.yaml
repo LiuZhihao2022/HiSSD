@@ -1,0 +1,14 @@
+dataset: 5m/expert
+env: sc2
+pretrain_tasks:
+- 5m
+pretrain_tasks_data_quality:
+  5m: expert
+task: marine-easy-expert
+test_tasks:
+- 5m
+test_tasks_data_quality: {}
+train_tasks:
+- 5m
+train_tasks_data_quality:
+  5m: expert

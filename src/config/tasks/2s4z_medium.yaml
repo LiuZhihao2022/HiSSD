@@ -1,0 +1,14 @@
+dataset: 2s4z/medium
+env: sc2
+pretrain_tasks:
+- 3m
+pretrain_tasks_data_quality:
+  3m: medium
+task: marine-easy-expert
+test_tasks:
+- 3m
+test_tasks_data_quality: {}
+train_tasks:
+- 3m
+train_tasks_data_quality:
+  3m: medium

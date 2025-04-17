@@ -1,5 +1,5 @@
-runner: "mt_episode"
-mcts_runner: "hier_mcts_episode"
+runner: "mt_parallel"
+mcts_runner: "hier_mcts_parallel"
 # only use for initializing action selector
 action_selector: "epsilon_greedy"
 epsilon_start: 1.0
@@ -77,7 +77,8 @@ adaptation: False
 debug: False
 
 # -----------------------hier-mcts params-----------------------
-batch_size: 1 # specially for episode runner
+batch_size: 2 # specially for episode runner
+batch_size_run: 2
 c_step: 5
 use_online_mcts: True # 暂时wm和mcts分开学, 只学stage 1
 online_steps: 2000500
@@ -99,4 +100,4 @@ offline_value_anneal_time: 500000
 save_model_interval_online: 50000
 test_nepisode_online: 20
 test_interval_online: 50000
-use_wandb: True
+use_wandb: False

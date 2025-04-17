@@ -121,6 +121,7 @@ def init_tasks(task_list, main_args, logger):
             "state": {"vshape": env_info["state_shape"]},
             "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
             "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+            "skills": {"vshape": (1,), "group": "agents", "dtype": th.long},
             "avail_actions": {
                 # TODO: 这里如果就是n_actions，会在什么地方出问题吗？
                 "vshape": (env_info["n_actions"],),
@@ -147,7 +148,8 @@ def init_tasks(task_list, main_args, logger):
             scheme["reward"] = {"vshape": (main_args.n_agents,)}
         groups = {"agents": task_args.n_agents}
         preprocess = {
-            "actions": ("actions_onehot", [OneHot(out_dim=task_args.n_actions)])
+            "actions": ("actions_onehot", [OneHot(out_dim=task_args.n_actions)]),
+            "skills": ("skills_onehot", [OneHot(out_dim=task_args.skill_dim)])
             # "actions": ("actions_onehot", [OneHot(out_dim=task_args.skill_dim)]),
         }
 
@@ -236,6 +238,7 @@ def train_sequential(
     #                 )
 
     # test_time_total += time.time() - test_start_time
+    
     # 这里每一次训练就是一次，t_max其实就是训练了t_max次
     while t_env < t_max:
         # shuffle tasks
@@ -374,7 +377,7 @@ def train_online_mcts(
     mcts_task2runner = {}
     for task in test_tasks:
         # 使用hier_mcts_episode_runner替换标准runner
-        mcts_task2runner[task] = r_REGISTRY["hier_mcts_episode"](
+        mcts_task2runner[task] = r_REGISTRY[main_args.mcts_runner](
             args=task2args[task],
             logger=logger,
             task=task
@@ -394,7 +397,8 @@ def train_online_mcts(
             n_agents = env_info["n_agents"]
             input_shape = obs_shape
             if task2args[task].obs_last_action:
-                input_shape += n_actions
+                # 这个是专门给PolicyRnn用的，这个网络是c步一输出，所以是skill_di
+                input_shape += main_args.skill_dim
             if task2args[task].obs_agent_id:
                 input_shape += n_agents
                 
@@ -470,10 +474,11 @@ def train_online_mcts(
             
             # 记录训练任务的统计信息
             episode_return = stats_info["episode_return"]
-            win = stats_info["win"]
+            win = stats_info["win_rate"]
             episode_length = stats_info["episode_length"]
             
             # 添加到训练统计
+            # Note: not use？
             train_task_stats[task]["returns"].append(episode_return)
             train_task_stats[task]["lengths"].append(episode_length)
             if win is not None:
@@ -594,7 +599,7 @@ def train_online_mcts(
                         test_stats[task]["returns"].append(stats_info["episode_return"])
                         test_stats[task]["lengths"].append(stats_info["episode_length"])
                         
-                        if stats_info["win"] is not None:
+                        if stats_info["win_rate"] is not None:
                             test_stats[task]["win_rates"].append(stats_info["win"])
             
             # 记录测试统计到控制台 - 只显示测试结果
@@ -861,22 +866,22 @@ def run_sequential(args, logger):
         )
     )
     # Stage 1 : train each task with offline data
-    train_sequential(
-        main_args.train_tasks,
-        main_args,
-        logger,
-        learner,
-        task2args,
-        task2runner,
-        task2offlinedata,
-    )
+    # train_sequential(
+    #     main_args.train_tasks,
+    #     main_args,
+    #     logger,
+    #     learner,
+    #     task2args,
+    #     task2runner,
+    #     task2offlinedata,
+    # )
 
-    # save the final model
-    if main_args.save_model:
-        save_path = os.path.join(main_args.save_dir, str(main_args.t_max))
-        os.makedirs(save_path, exist_ok=True)
-        logger.console_logger.info("Saving final models to {}".format(save_path))
-        learner.save_models(save_path)
+    # # save the final model
+    # if main_args.save_model:
+    #     save_path = os.path.join(main_args.save_dir, str(main_args.t_max))
+    #     os.makedirs(save_path, exist_ok=True)
+    #     logger.console_logger.info("Saving final models to {}".format(save_path))
+    #     learner.save_models(save_path)
 
     # Stage 2 : online training with hierarchical ma gumbel muzero
     if getattr(main_args, "use_online_mcts", False):

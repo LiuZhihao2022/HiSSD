@@ -119,6 +119,32 @@ class PolicyOutput(Generic[T]):
   action_weights: chex.Array
   search_tree: tree.Tree[T]
 
+  def split_by_batch(self):
+    """将整个batch的PolicyOutput拆分为每个batch一个PolicyOutput对象列表。"""
+    batch_size = self.action.shape[0]
+    outputs = []
+    for i in range(batch_size):
+      outputs.append(
+        PolicyOutput(
+          action=self.action[i:i+1],
+          chosen_skill=self.chosen_skill[i:i+1],
+          action_weights=self.action_weights[i:i+1],
+          search_tree=self.search_tree.get_single_batch(i)
+        )
+      )
+    return outputs
+
+  def _policyoutput_getitem(self, idx):
+      return PolicyOutput(
+          action=self.action[idx:idx+1],
+          chosen_skill=self.chosen_skill[idx:idx+1],
+          action_weights=self.action_weights[idx:idx+1],
+          search_tree=self.search_tree.get_single_batch(idx)
+      )
+
+# 强制覆盖chex自动加的__getitem__
+PolicyOutput.__getitem__ = PolicyOutput._policyoutput_getitem
+
 
 @chex.dataclass(frozen=True)
 class DecisionRecurrentFnOutput:

@@ -194,6 +194,7 @@ class HISSDAgent(nn.Module):
             task_decomposer = self.task2decomposer[task]
             return task_decomposer.n_agents + task_decomposer.n_enemies
         return 0
+    # 这个函数没有使用，controller里就简单处理了一下
     def preprocess_obs(self, inputs, task):
         # hidden_state = hidden_state.reshape(-1, 1, self.entity_embed_dim)
         # get decomposer, last_action_shape and n_agents of this specific task
@@ -868,11 +869,11 @@ class PlannerModel(nn.Module):
         assert forward_type in ['action', 'value', 'reward']
         own_emb, enemy_emb, ally_emb = inputs
         n_enemy, n_ally = enemy_emb.shape[1], ally_emb.shape[1]
-        # if forward_type == "reward":
-        #     emb = self.state_encoder(additional_input,task)
-        # elif forward_type == "action" or forward_type == "value":
-        #     emb = self.obs_encoder(additional_input,task)
-        emb = self.obs_encoder(additional_input,task)
+        if forward_type == "reward" or forward_type == "value":
+            emb = self.state_encoder(additional_input,task)
+        elif forward_type == "action":
+            emb = self.obs_encoder(additional_input,task)
+        # emb = self.obs_encoder(additional_input,task)
         own_emb, enemy_emb, ally_emb = emb
         if additional_input is None:
             raise ValueError("additional_input should not be None")
@@ -1210,7 +1211,7 @@ class MergeRec(nn.Module):
         self.obs_pred = nn.ModuleDict()
         self.state_pred = nn.ModuleDict()
         for task in task2input_shape_info:
-            input_shape = task2input_shape_info[task]['input_shape']
+            input_shape = task2input_shape_info[task]['input_shape_skill']
             n_enemies = self.task2decomposer[task].n_enemies
             n_agents = self.task2decomposer[task].n_agents
             obs_dim = self.task2decomposer[task].obs_dim

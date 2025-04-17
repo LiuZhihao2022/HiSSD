@@ -7,6 +7,7 @@ from mctx._src import tree as tree_lib
 from mctx._src.optimizer_wrapper import ValueOptimizerWrapper
 import copy
 import jax
+import torch
 import jax.numpy as jnp
 
 class PolicyValueNetwork(nn.Module):
@@ -284,8 +285,11 @@ class PolicyRNN(nn.Module):
             self.optimizer = torch.optim.RMSprop(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), lr=1e-3)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
-    def get_hidden_states(self):
-        return self.policy_hidden, self.critic_hidden
+    def get_hidden_states(self, bs_id=None):
+        if bs_id is None:
+            return self.policy_hidden, self.critic_hidden
+        else:
+            return self.policy_hidden[bs_id], self.critic_hidden[bs_id]
     def init_hidden(self, batch_size=1):
         self.policy_hidden = self.policy_network.init_hidden(batch_size, self.num_agents)
         self.critic_hidden = self.critic_network.init_hidden(batch_size)
@@ -492,11 +496,14 @@ class ReplayBufferList:
         self.use_real_data = use_real_data
 
     def push(self, replay_buffer):
-        if len(self.replay_buffer_list) < self.capacity:
-            self.replay_buffer_list.append(replay_buffer)
-        else:
-            self.replay_buffer_list[self.position] = replay_buffer
-        self.position = (self.position + 1) % self.capacity
+        # 支持传入单个 ReplayBuffer 或者包含多个 ReplayBuffer 的 list
+        buffers = replay_buffer if isinstance(replay_buffer, list) else [replay_buffer]
+        for buf in buffers:
+            if len(self.replay_buffer_list) < self.capacity:
+                self.replay_buffer_list.append(buf)
+            else:
+                self.replay_buffer_list[self.position] = buf
+            self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size: int) -> list:
         sample_size = max(batch_size // self.replay_buffer_list[0].batch_size, 1)
@@ -520,86 +527,116 @@ def compute_prior_from_qvalues(q_values: np.ndarray, temperature: float = 0.5, m
         q_values = (q_values - np.min(q_values, axis=-1, keepdims=True)) / (np.max(q_values, axis=-1, keepdims=True) - np.min(q_values, axis=-1, keepdims=True))
     return np.exp(q_values / temperature) / np.sum(np.exp(q_values / temperature), axis=-1, keepdims=True)
 
-def prepare_batch_data(sampled_batch: Tuple, max_visit_init=50.0, value_scale=0.1, use_real_data=False) -> Tuple:
-    states = np.array([])
-    observations = np.array([])
-    next_states = np.array([])
-    actions = np.array([])
-    rewards = np.array([])
-    improved_policy_probs = np.array([])
-    policy_hidden_states = np.array([])
-    critic_hidden_states = np.array([])
-    experienced_thresholds = np.array([])
-    advantages = np.array([])
-    sampled_actions_list = np.array([])
-    dones = np.array([])
-    visit_scales = np.array([])
+def prepare_batch_data(sampled_batch: Tuple,
+                       max_visit_init: float = 50.0,
+                       value_scale: float = 0.1,
+                       use_real_data: bool = False) -> Tuple:
+    """
+    Unify conversion of all torch.Tensor to numpy and collect batch data.
+    Returns:
+        states, observations, actions, rewards, next_states, dones,
+        experienced_thresholds, improved_policy_probs,
+        policy_hidden_states, critic_hidden_states,
+        advantages, sampled_actions_list
+    """
 
-    for i in range(len(sampled_batch)):
+    def to_np(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.array(x)
+
+    # prepare containers
+    states = []
+    observations = []
+    actions = []
+    rewards = []
+    next_states = []
+    dones = []
+    experienced_thresholds = []
+    improved_policy_probs = []
+    policy_hidden_states = []
+    critic_hidden_states = []
+    advantages = []
+    sampled_actions_list = []
+
+    for entry in sampled_batch:
         if not use_real_data:
-            policy_output, experienced_threshold, advantage, root_policy_hidden_state, root_critic_hidden_state = sampled_batch[i]
-        else:
-            policy_output, experienced_threshold, advantage, root_policy_hidden_state, root_critic_hidden_state, real_r, real_next_obs, real_next_state, real_done = sampled_batch[i]
 
-        tree, action, action_weights = policy_output.search_tree, policy_output.action, policy_output.action_weights
+            policy_output, experienced_threshold, advantage, \
+                root_policy_h, root_critic_h = entry
+        else:
+            (policy_output, experienced_threshold, advantage,
+             root_policy_h, root_critic_h,
+             real_r, real_next_obs, real_next_state, real_done) = entry
+
+
+        tree = policy_output.search_tree
+        action = policy_output.action
+        action_weights = policy_output.action_weights
+
         root_idx = tree_lib.Tree.ROOT_INDEX
-        sampled_actions = tree.sampled_actions[:, root_idx]
-        batch_range = np.arange(tree.embeddings.shape[0])
-        visit_count = tree.children_visits[batch_range, root_idx]
+        batch_idx = np.arange(tree.embeddings.shape[0])
+
+        # sample data from the tree
+        sampled_actions = to_np(tree.sampled_actions[:, root_idx])
+        visit_count = tree.children_visits[batch_idx, root_idx]
         max_visit = np.max(visit_count, axis=-1, keepdims=True)
         visit_scale = max_visit + max_visit_init
-        transformed_advantage = visit_scale * value_scale * advantage
-
+        transformed_adv = visit_scale * value_scale * advantage
         if not use_real_data:
-            state = tree.embeddings[:, root_idx]
-            observation = tree.observations[:, root_idx]
-            reward = np.array([tree.children_rewards[br, root_idx, a] for br, a in zip(batch_range, action)])
-            next_state = np.array([tree.embeddings[br, tree.children_index[br, root_idx, a]] for br, a in zip(batch_range, action)])
-            # note there is no end in current world model, so the done is always False
-            done = np.zeros_like(reward, dtype=bool)
-        else:
-            # TODO: check shape here
-            state = real_next_state
-            observation = real_next_obs
-            reward = [real_r]
-            next_state = real_next_state
-            done = [real_done]
-        if len(states) == 0:
-            states = state.detach().cpu().numpy()
-            observations = observation.detach().cpu().numpy()
-            actions = action
-            rewards = reward
-            next_states = next_state.detach().cpu().numpy()
-            dones = done
-            experienced_thresholds = experienced_threshold
-            improved_policy_probs = action_weights
-            policy_hidden_states = root_policy_hidden_state.detach().cpu().numpy()
-            critic_hidden_states = root_critic_hidden_state.detach().cpu().numpy()
-            advantages = transformed_advantage
-            sampled_actions_list = sampled_actions
-        else:
-            states = np.concatenate((states, state.detach().cpu().numpy()))
-            observations = np.concatenate((observations, observation.detach().cpu().numpy()))
-            actions = np.concatenate((actions, action))
-            rewards = np.concatenate((rewards, reward))
-            dones = np.concatenate((dones, done))
-            next_states = np.concatenate((next_states, next_state.detach().cpu().numpy()))
-            experienced_thresholds = np.concatenate((experienced_thresholds, experienced_threshold))
-            improved_policy_probs = np.concatenate((improved_policy_probs, action_weights))
-            policy_hidden_states = np.concatenate((policy_hidden_states, root_policy_hidden_state.detach().cpu().numpy()))
-            critic_hidden_states = np.concatenate((critic_hidden_states, root_critic_hidden_state.detach().cpu().numpy()))
-            advantages = np.concatenate((advantages, transformed_advantage))
-            sampled_actions_list = np.concatenate((sampled_actions_list, sampled_actions))
+            state_np = to_np(tree.embeddings[:, root_idx])
+            obs_np = to_np(tree.observations[:, root_idx])
+            reward_np = np.array([tree.children_rewards[b, root_idx, a]
+                                  for b, a in zip(batch_idx, action)])
+            next_state_np = np.array([tree.embeddings[br, tree.children_index[br, root_idx, a]] for br, a in zip(batch_range, action)])
+            done_np = np.zeros_like(reward_np, dtype=bool)
 
-    return (np.array(states),
-            np.array(observations),
-            np.array(actions),
-            np.array(rewards),
-            np.array(next_states),
-            np.array(dones),
-            np.array(experienced_thresholds),
-            np.array(improved_policy_probs),
-            np.array(policy_hidden_states),
-            np.array(critic_hidden_states),
-            np.array(advantages),
-            np.array(sampled_actions_list))
+        else:
+
+            # real data path
+            state_np = to_np(real_next_state)
+            obs_np = to_np(real_next_obs)
+            reward_np = [to_np(real_r)]
+            next_state_np = to_np(real_next_state)
+            done_np = [to_np(real_done)]
+
+        # append to lists
+        states.append(state_np)
+        observations.append(obs_np)
+        actions.append(to_np(action))
+        rewards.append(reward_np)
+        next_states.append(next_state_np)
+        dones.append(done_np)
+        experienced_thresholds.append(to_np(experienced_threshold))
+        improved_policy_probs.append(to_np(action_weights))
+        policy_hidden_states.append(to_np(root_policy_h))
+        critic_hidden_states.append(to_np(root_critic_h))
+        advantages.append(to_np(transformed_adv))
+        sampled_actions_list.append(sampled_actions)
+
+    # concatenate along batch dimension
+    states = np.concatenate(states, axis=0)
+    observations = np.concatenate(observations, axis=0)
+    actions = np.concatenate(actions, axis=0)
+    rewards = np.concatenate(rewards, axis=0)
+    next_states = np.concatenate(next_states, axis=0)
+    dones = np.concatenate(dones, axis=0)
+    experienced_thresholds = np.concatenate(experienced_thresholds, axis=0)
+    improved_policy_probs = np.concatenate(improved_policy_probs, axis=0)
+    policy_hidden_states = np.concatenate(policy_hidden_states, axis=0)
+    critic_hidden_states = np.concatenate(critic_hidden_states, axis=0)
+    advantages = np.concatenate(advantages, axis=0)
+    sampled_actions_list = np.concatenate(sampled_actions_list, axis=0)
+
+    return (states,
+            observations,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            experienced_thresholds,
+            improved_policy_probs,
+            policy_hidden_states,
+            critic_hidden_states,
+            advantages,
+            sampled_actions_list)

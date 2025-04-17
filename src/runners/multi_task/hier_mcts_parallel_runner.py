@@ -2,11 +2,12 @@ import numpy as np
 import torch as th
 import copy
 import sys
+sys.path.append('/home/liuzhihao/HiSSD')
 import logging
 import pickle
 import cloudpickle
 import functools
-# import mctx
+import mctx
 
 from envs import REGISTRY as env_REGISTRY
 from functools import partial
@@ -69,11 +70,19 @@ class HierMCTSParallelRunner:
         
         # MCTS相关参数
         self.c_step = args.c_step
-        self.num_simulations = args.num_simulations if hasattr(args, "num_simulations") else 32
-        self.max_num_considered_actions = args.max_num_considered_actions if hasattr(args, "max_num_considered_actions") else 16
-        self.use_mixed_value = args.use_mixed_value if hasattr(args, "use_mixed_value") else False
-        self.k = args.k if hasattr(args, "k") else 10
-        self.temperature = args.temperature if hasattr(args, "temperature") else 1.0
+        self.num_simulations = getattr(args, "num_simulations", 32)
+        self.max_num_considered_actions = getattr(args, "max_num_considered_actions", 16)
+        self.use_mixed_value = getattr(args, "use_mixed_value", False)
+        self.k = getattr(args, "k", 10)
+        self.temperature = getattr(args, "temperature", 1.0)
+
+        # 新增：并行相关的状态变量
+        self.current_skill_indices = [None for _ in range(self.batch_size)]
+        self.current_mcts_data = [None for _ in range(self.batch_size)]
+        self.last_skill_selection_t = [0 for _ in range(self.batch_size)]
+        self.accumulated_rewards = [0 for _ in range(self.batch_size)]
+        self.terminated = [False for _ in range(self.batch_size)]
+        self.wm_hidden_states = None
 
     def setup(self, scheme, groups, preprocess, mac, mcts_network):
         self.new_batch = partial(
@@ -98,13 +107,12 @@ class HierMCTSParallelRunner:
         self.n_ally = self.n_agents - 1
         
         # 为每个环境实例初始化状态
-        self.wm_hidden_states = [self.mac.init_hidden_wm(batch_size=1, task=self.task) 
-                               for _ in range(self.batch_size)]
+        self.wm_hidden_states = self.mac.init_hidden_wm(batch_size=self.batch_size, task=self.task)
         
         # 创建递归函数
         self.recurrent_fn = make_recurrent_fn_world_model(
             self.mac, 
-            1,  # 每个环境实例单独处理，所以batch_size=1
+            self.batch_size,  # 每个环境实例单独处理，所以batch_size=1
             self.mcts_network,
             self.temperature,
             self.n_agents,
@@ -156,154 +164,127 @@ class HierMCTSParallelRunner:
         self.t = 0
         self.env_steps_this_run = 0
         
-        # 重置MCTS相关数据
-        self.wm_hidden_states = [self.mac.init_hidden_wm(batch_size=1, task=self.task) 
-                               for _ in range(self.batch_size)]
-        
+        # 并行相关状态变量初始化
+        self.current_skill_indices = [None for _ in range(self.batch_size)]
+        self.current_mcts_data = [None for _ in range(self.batch_size)]
+        self.last_skill_selection_t = [0 for _ in range(self.batch_size)]
+        self.accumulated_rewards = [0 for _ in range(self.batch_size)]
+        self.terminated = [False for _ in range(self.batch_size)]
+        self.wm_hidden_states = self.mac.init_hidden_wm(batch_size=self.batch_size, task=self.task)
         self.replay_buffers_mcts = [ReplayBuffer(
             self.episode_limit//self.c_step + 1,
             1,
             self.c_step,
             use_real_data=True
         ) for _ in range(self.batch_size)]
-        
-        self.current_skill_indices = [None for _ in range(self.batch_size)]
-        self.current_mcts_data = [None for _ in range(self.batch_size)]
-        self.last_skill_selection_t = [0 for _ in range(self.batch_size)]
-        self.accumulated_rewards = [0 for _ in range(self.batch_size)]
-        self.last_observations = [None for _ in range(self.batch_size)]
-        self.last_states = [None for _ in range(self.batch_size)]
 
-    def run(self, test_mode=False, pretrain_phase=False):
+    def run(self, test_mode=False, nolog=False, pretrain=False):
         self.reset()
 
-        all_terminated = False
         episode_returns = [0 for _ in range(self.batch_size)]
         episode_lengths = [0 for _ in range(self.batch_size)]
         self.mac.init_hidden(batch_size=self.batch_size, task=self.task)
-        terminated = [False for _ in range(self.batch_size)]
+        terminated = self.terminated
         envs_not_terminated = [b_idx for b_idx, termed in enumerate(terminated) if not termed]
-        final_env_infos = []  # 按终止顺序存储额外信息
+        # 用于存储每个环境的最终env_info
+        final_env_infos = [None for _ in range(self.batch_size)]
 
         while True:
-            # 为未终止的环境选择技能（如果需要）
-            if not pretrain_phase:
-                for idx in envs_not_terminated:
-                    current_t = episode_lengths[idx]
-                    # 每隔c_step步或者初始状态时选择技能
-                    if current_t % self.c_step == 0:
-                        # 存储上一个周期的MCTS数据（如果有）
-                        if self.current_mcts_data[idx] is not None and current_t > 0:
-                            current_input = self.mac._build_inputs(self.batch, t=self.t, task=self.task, bs=[idx]).reshape(1, self.n_agents, -1)
-                            current_state = self.batch["state"][idx:idx+1, self.t]
-                            
-                            policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state = self.current_mcts_data[idx]
-                            self.replay_buffers_mcts[idx].push(
-                                policy_output, 
-                                experienced_thresholds, 
-                                advantages, 
-                                root_policy_hidden_state, 
-                                root_critic_hidden_state,
-                                real_r=self.accumulated_rewards[idx],
-                                real_next_obs=current_input,
-                                real_next_state=current_state,
-                                real_done=np.zeros(1, dtype=bool)  # 中间步骤不是终止状态
-                            )
-                            self.accumulated_rewards[idx] = 0
-                        
-                        # 使用MCTS选择技能
-                        mcts_results = self._select_skill_with_mcts(idx)
-                        self.current_skill_indices[idx] = mcts_results[0]
-                        self.current_mcts_data[idx] = mcts_results[1:]
-                        self.last_skill_selection_t[idx] = current_t
-                        current_input = self.mac._build_inputs(self.batch, t=self.t, task=self.task, bs=[idx]).reshape(1, self.n_agents, -1)
-                        self.last_observations[idx] = current_input
-                        self.last_states[idx] = self.batch["state"][idx:idx+1, self.t]
-            
-            # 根据当前选择的技能或直接选择动作
-            if pretrain_phase:
-                # 预训练阶段，随机选择动作
+            # 1. 批量skill选择
+            skill_select_envs = []
+            for idx in envs_not_terminated:
+                if episode_lengths[idx] % self.c_step == 0:
+                    skill_select_envs.append(idx)
+            if not pretrain and skill_select_envs:
+                skill_indices, mcts_datas, new_wm_hidden_states = self._batch_select_skill_with_mcts(skill_select_envs)
+                for i, env_idx in enumerate(skill_select_envs):
+                    if self.current_mcts_data[env_idx] is not None and episode_lengths[env_idx] > 0:
+                        current_input = self.mac._build_inputs(self.batch[env_idx], t=self.t, task=self.task, use_skill=True).reshape(1, self.n_agents, -1)
+                        current_state = self.batch["state"][env_idx:env_idx+1, self.t]
+                        policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state = self.current_mcts_data[env_idx]
+                        self.replay_buffers_mcts[env_idx].push(
+                            policy_output, 
+                            experienced_thresholds, 
+                            advantages, 
+                            root_policy_hidden_state, 
+                            root_critic_hidden_state,
+                            real_r=self.accumulated_rewards[env_idx],
+                            real_next_obs=current_input,
+                            real_next_state=current_state,
+                            real_done=np.zeros(1, dtype=bool)
+                        )
+                        self.accumulated_rewards[env_idx] = 0
+                    self.current_skill_indices[env_idx] = skill_indices[i]
+                    self.current_mcts_data[env_idx] = mcts_datas[i]
+                    self.last_skill_selection_t[env_idx] = episode_lengths[env_idx]
+                    self.wm_hidden_states[env_idx] = new_wm_hidden_states[i]
+
+            # 2. 批量动作选择
+            if pretrain:
                 actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=0, task=self.task, bs=envs_not_terminated, test_mode=False)
-            else:
-                # 使用当前选择的技能来选择动作
+            else:   
+                # 已经存在占位了，不会报错
                 skill_indices = [self.current_skill_indices[idx] for idx in envs_not_terminated]
-                actions = self.mac.forward_action_skill_batch(
+                # 这里一定要讲bs=envs_not_terminated传入，因为设计选取hidden state
+                actions = self.mac.forward_action_skill(
                     self.batch,
                     t=self.t,
-                    skill_indices=skill_indices,
+                    skill_index=skill_indices,
                     task=self.task,
                     bs=envs_not_terminated,
                     test_mode=test_mode,
                 )
-                
-                # 根据可用动作选择实际动作
                 actions = self.mac.action_selector.select_action(
                     actions,
-                    self.batch["avail_actions"][:, self.t],
+                    self.batch[envs_not_terminated]["avail_actions"][:, self.t],
                     t_env=self.t_env,
                     test_mode=test_mode,
-                    bs=envs_not_terminated
+                    # bs=envs_not_terminated
                 )
-            
             cpu_actions = actions.to("cpu").numpy()
 
-            # 更新选择的动作
+            # 3. 更新动作
             actions_chosen = {
                 "actions": actions.unsqueeze(1)
             }
             self.batch.update(actions_chosen, bs=envs_not_terminated, ts=self.t, mark_filled=False)
 
-            # 向每个环境发送动作
+            # 4. 环境步进
             action_idx = 0
             for idx, parent_conn in enumerate(self.parent_conns):
-                if idx in envs_not_terminated:  # 为该环境生成了动作
-                    if not terminated[idx]:  # 只有未终止的环境才发送动作
-                        parent_conn.send(("step", cpu_actions[action_idx]))
-                    action_idx += 1  # 递增动作索引
+                if idx in envs_not_terminated and not terminated[idx]:
+                    parent_conn.send(("step", cpu_actions[action_idx]))
+                    action_idx += 1
 
-            # 更新未终止环境列表
-            envs_not_terminated = [b_idx for b_idx, termed in enumerate(terminated) if not termed]
-            all_terminated = all(terminated)
-            if all_terminated:
-                break
-
-            # 当前时间步要插入的数据
+            # 5. 收集环境反馈
             post_transition_data = {
                 "reward": [],
-                "terminated": []
+                "terminated": [],
             }
-            # 下一时间步要插入的数据
             pre_transition_data = {
                 "state": [],
                 "avail_actions": [],
                 "avail_skills": [],
                 "obs": []
             }
-
-            # 接收每个未终止环境的数据
             for idx, parent_conn in enumerate(self.parent_conns):
                 if not terminated[idx]:
                     data = parent_conn.recv()
-                    # 当前时间步的剩余数据
                     post_transition_data["reward"].append((data["reward"],))
-
                     episode_returns[idx] += data["reward"]
                     episode_lengths[idx] += 1
                     if not test_mode:
                         self.env_steps_this_run += 1
-                    
-                    # 累积当前技能周期的奖励
-                    if not pretrain_phase:
+                    if not pretrain:
                         self.accumulated_rewards[idx] = self.args.gamma * self.accumulated_rewards[idx] + data["reward"]
-
                     env_terminated = False
                     if data["terminated"]:
-                        final_env_infos.append(data["info"])
-                        
-                        # 环境终止时，存储最后一个MCTS周期数据（如果有）
-                        if not pretrain_phase and self.current_mcts_data[idx] is not None:
-                            final_input = self.mac._build_inputs(self.batch, t=self.t, task=self.task, bs=[idx]).reshape(1, self.n_agents, -1)
-                            final_state = data["state"]
+                        # 保存最后一步的env_info
+                        final_env_infos[idx] = data["info"]
+                        if not pretrain and self.current_mcts_data[idx] is not None:
+                            # 这样是不是可以保留batch的第一个维度？
+                            final_input = self.mac._build_inputs(self.batch[idx], t=self.t, task=self.task, use_skill=True).reshape(1, self.n_agents, -1)
+                            final_state = data["state"][np.newaxis, :]  # Add batch dimension
                             policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state = self.current_mcts_data[idx]
                             self.replay_buffers_mcts[idx].push(
                                 policy_output, 
@@ -314,82 +295,49 @@ class HierMCTSParallelRunner:
                                 real_r=self.accumulated_rewards[idx],
                                 real_next_obs=final_input,
                                 real_next_state=final_state,
-                                real_done=np.ones(1, dtype=bool)  # 结束状态
+                                real_done=np.ones(1, dtype=bool)
                             )
-                            
                     if data["terminated"] and not data["info"].get("episode_limit", False):
                         env_terminated = True
                     terminated[idx] = data["terminated"]
                     post_transition_data["terminated"].append((env_terminated,))
-
-                    # 下一时间步选择动作需要的数据
                     pre_transition_data["state"].append(data["state"])
                     pre_transition_data["avail_actions"].append(data["avail_actions"])
                     pre_transition_data["obs"].append(data["obs"])
                     pre_transition_data["avail_skills"].append(np.ones((self.n_agents, self.args.skill_dim)))
-
-            # 将数据添加到batch中
+            # 6. 更新batch
             self.batch.update(post_transition_data, bs=envs_not_terminated, ts=self.t, mark_filled=False)
-
-            # 进入下一个时间步
             self.t += 1
-
-            # 添加预过渡数据
             self.batch.update(pre_transition_data, bs=envs_not_terminated, ts=self.t, mark_filled=True)
+            # 7. 更新envs_not_terminated
+            envs_not_terminated = [b_idx for b_idx, termed in enumerate(terminated) if not termed]
+            if not envs_not_terminated:
+                break
 
         if not test_mode:
             self.t_env += self.env_steps_this_run
 
-        # 获取每个环境的统计信息
-        for parent_conn in self.parent_conns:
-            parent_conn.send(("get_stats", None))
+        # 直接返回所有环境的replay buffer列表
+        replay_buffers = self.replay_buffers_mcts if not pretrain else None
 
-        env_stats = []
-        for parent_conn in self.parent_conns:
-            env_stat = parent_conn.recv()
-            env_stats.append(env_stat)
-
-        # 合并所有环境的MCTS回放缓冲区
-        combined_replay_buffer = None
-        if not pretrain_phase:
-            # 创建一个足够大的缓冲区来存储所有数据
-            max_steps = max([buffer.step for buffer in self.replay_buffers_mcts if buffer.step > 0], default=0)
-            if max_steps > 0:
-                combined_replay_buffer = ReplayBuffer(
-                    max_steps,
-                    self.batch_size,
-                    self.c_step,
-                    use_real_data=True
-                )
-                # 合并各个环境的回放缓冲区数据
-                for idx, buffer in enumerate(self.replay_buffers_mcts):
-                    if buffer.step > 0:
-                        for i in range(buffer.step):
-                            data = buffer.get_data(i)
-                            combined_replay_buffer.push(
-                                data['policy_output'],
-                                data['experienced_thresholds'],
-                                data['advantages'],
-                                data['root_policy_hidden_state'],
-                                data['root_critic_hidden_state'],
-                                real_r=data['real_r'],
-                                real_next_obs=data['real_next_obs'],
-                                real_next_state=data['real_next_state'],
-                                real_done=data['real_done']
-                            )
-
-        # 记录统计信息
-        if not pretrain_phase:        
+        # 记录统计信息，与episode_runner对齐
+        result_info = {}
+        if not pretrain:
             cur_stats = self.test_stats if test_mode else self.train_stats
             cur_returns = self.test_returns if test_mode else self.train_returns
             log_prefix = f"{self.task}/test_" if test_mode else f"{self.task}/"
-            infos = [cur_stats] + final_env_infos
-            cur_stats.update({k: sum(d.get(k, 0) for d in infos) for k in set.union(*[set(d) for d in infos])})
-            cur_stats["n_episodes"] = self.batch_size + cur_stats.get("n_episodes", 0)
-            cur_stats["ep_length"] = sum(episode_lengths) + cur_stats.get("ep_length", 0)
-
+            # 用final_env_infos替换原有的env_stats
+            infos = [cur_stats] + [info for info in final_env_infos if info is not None]
+            # 合并所有info的key
+            all_keys = set()
+            for d in infos:
+                all_keys |= set(d)
+            # 统计所有key的和
+            merged_stats = {k: sum(d.get(k, 0) for d in infos) for k in all_keys}
+            merged_stats["n_episodes"] = self.batch_size + cur_stats.get("n_episodes", 0)
+            merged_stats["ep_length"] = sum(episode_lengths) + cur_stats.get("ep_length", 0)
+            cur_stats.update(merged_stats)
             cur_returns.extend(episode_returns)
-
             n_test_runs = max(1, self.args.test_nepisode // self.batch_size) * self.batch_size
             if test_mode and (len(self.test_returns) == n_test_runs):
                 self._log(cur_returns, cur_stats, log_prefix)
@@ -399,49 +347,73 @@ class HierMCTSParallelRunner:
                     self.logger.log_stat(f"{self.task}/epsilon", self.mac.action_selector.epsilon, self.t_env)
                 self.log_train_stats_t = self.t_env
 
-        return self.batch, combined_replay_buffer
+            # 统计返回
+            avg_return = float(np.mean(episode_returns)) if episode_returns else 0.0
+            avg_length = float(np.mean(episode_lengths)) if episode_lengths else 0.0
+            # 取第一个非None的final_env_info
+            stats_info = {}
+            # 统计 battle_won 的平均值
+            wins = [info.get("battle_won", 0) for info in final_env_infos if info is not None]
+            avg_win = float(sum(wins)) / len(wins) if wins else 0.0
 
-    def _select_skill_with_mcts(self, env_idx):
-        """
-        为特定环境实例使用MCTS选择技能
-        
-        Args:
-            env_idx: 环境实例的索引
-            
-        Returns:
-            tuple: 包含技能选择结果的元组
-        """
-        # 获取当前状态和观测
-        state_inputs = self.batch["state"][env_idx:env_idx+1, self.t]
-        # 获取上一步的动作
-        batch_last_action = None
-        if self.t > 0:
-            batch_last_action = self.batch["actions_onehot"][env_idx:env_idx+1, self.t - 1]
-        
-        # 处理状态输入
-        state_inputs = state_inputs.reshape(1, -1).cpu().numpy()
-        # 处理观测输入
-        obs_inputs = self.mac.preprocess_obs(self.batch, self.t, self.task, bs=[env_idx]).cpu().numpy()
-        
-        # 初始化根节点
-        root, experienced_thresholds, root_policy_hidden_state, root_critic_hidden_state = initialize_root(
-            self.mcts_network, 
-            state_inputs, 
-            obs_inputs, 
+            # 统计所有 final_env_infos 中各项指标的平均值作为 stats_info
+            stats_info = {}
+            # 收集所有非 None 的 info 的键
+            keys = set(k for info in final_env_infos if info for k in info)
+            # 计算每个键的平均值
+            for k in keys:
+                vals = [info.get(k, 0) for info in final_env_infos if info is not None and k in info]
+                stats_info[k] = float(sum(vals) / len(vals)) if vals else 0.0
+
+            result_info = {
+                "episode_return": avg_return,
+                "win_rate": avg_win,
+                "episode_length": avg_length,
+                "stats": stats_info
+            }
+        else:
+            result_info = {}
+
+        return self.batch, replay_buffers, result_info
+
+    def _batch_select_skill_with_mcts(self, env_indices):
+        # env_indices: 需要新skill的环境下标
+        batch_size = len(env_indices)
+        # 构造batch输入
+        state_inputs = []
+        obs_inputs = []
+        wm_hidden_states = []
+        for idx in env_indices:
+            state = self.batch["state"][idx:idx+1, self.t].reshape(1, -1).cpu().numpy()
+            obs = self.mac.preprocess_obs(self.batch[idx], self.t, self.task, use_skill=True).cpu().numpy()
+            state_inputs.append(state)
+            obs_inputs.append(obs)
+            wm_hidden_states.append(self.wm_hidden_states[idx])
+        # 拼接为batch
+        state_inputs = np.concatenate(state_inputs, axis=0)  # [B, state_dim]
+        obs_inputs = np.concatenate(obs_inputs, axis=0)      # [B, n_agents, obs_dim]
+        wm_hidden_states = th.stack(wm_hidden_states, axis=0)  # [B, ...]
+        # 批量初始化root
+        roots, experienced_thresholds, root_policy_hidden_states, root_critic_hidden_states = initialize_root(
+            self.mcts_network,
+            state_inputs,
+            obs_inputs,
             self.k,
             self.n_agents,
             self.args.skill_dim,
-            wm_hidden_states=self.wm_hidden_states[env_idx]
+            wm_hidden_states=wm_hidden_states,
+            bs_id=env_indices,
         )
-        
-        # 运行MCTS搜索
-        policy_output, timing_stats, advantages = mctx.gumbel_muzero_policy(
+        # 批量运行MCTS
+        policy_output, timing_stats, advantages, new_wm_hidden_states = mctx.gumbel_muzero_policy(
             params=(),
             rng_key=np.random.RandomState(),
-            root=root,
+            root=roots,
             recurrent_fn=self.recurrent_fn,
             num_simulations=self.num_simulations,
             task=self.task,
+            current_t_env=self.t_env,
+            args=self.args,
             max_num_considered_actions=self.max_num_considered_actions,
             max_depth=None,
             qtransform=functools.partial(
@@ -449,12 +421,21 @@ class HierMCTSParallelRunner:
                 use_mixed_value=self.use_mixed_value,
             ),
         )
-        
-        # 更新world model的隐藏状态
-        self.wm_hidden_states[env_idx] = root_policy_hidden_state
-        
-        # 返回选择的技能和相关数据
-        return policy_output.chosen_skill, policy_output, experienced_thresholds, advantages, root_policy_hidden_state, root_critic_hidden_state
+        # policy_output等为batch结构
+        skill_indices = policy_output.chosen_skill  # [B]
+        # 按batch拆分
+        mcts_datas = []
+        new_wm_hidden_states = th.tensor(np.array(new_wm_hidden_states)).to(self.args.device)
+        for i in range(batch_size):
+            mcts_datas.append((
+                policy_output[i],
+                experienced_thresholds[i:i+1],
+                advantages[i:i+1],
+                root_policy_hidden_states[i:i+1],
+                root_critic_hidden_states[i:i+1]
+            ))
+            # TODO: skill_indices对应的节点的wm_hidden_states作为new_wm_hidden_states
+        return skill_indices, mcts_datas, new_wm_hidden_states
 
     def _log(self, returns, stats, prefix):
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)
@@ -504,7 +485,7 @@ def env_worker(remote, env_fn):
         elif cmd == "get_env_info":
             remote.send(env.get_env_info())
         elif cmd == "get_stats":
-            remote.send(env.get_stats())
+                    remote.send(env.get_stats())
         else:
             raise NotImplementedError
 
