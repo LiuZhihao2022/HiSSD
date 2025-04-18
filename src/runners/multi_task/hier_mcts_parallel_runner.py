@@ -226,19 +226,21 @@ class HierMCTSParallelRunner:
                 # 已经存在占位了，不会报错
                 skill_indices = [self.current_skill_indices[idx] for idx in envs_not_terminated]
                 # 这里一定要讲bs=envs_not_terminated传入，因为设计选取hidden state
+                # 对于q mode（目前的mode），test_mode参数无影响，输出的是q值。如果是pi_logit mode，那么就没有随机性。
                 actions = self.mac.forward_action_skill(
                     self.batch,
                     t=self.t,
                     skill_index=skill_indices,
                     task=self.task,
                     bs=envs_not_terminated,
-                    test_mode=test_mode,
+                    test_mode=True,
                 )
+                # 选择基本动作时，不需要随机性，直接将skill解码
                 actions = self.mac.action_selector.select_action(
                     actions,
                     self.batch[envs_not_terminated]["avail_actions"][:, self.t],
                     t_env=self.t_env,
-                    test_mode=test_mode,
+                    test_mode=True,
                     # bs=envs_not_terminated
                 )
             cpu_actions = actions.to("cpu").numpy()

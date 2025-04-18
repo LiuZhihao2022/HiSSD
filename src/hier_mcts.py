@@ -866,22 +866,25 @@ def run_sequential(args, logger):
         )
     )
     # Stage 1 : train each task with offline data
-    # train_sequential(
-    #     main_args.train_tasks,
-    #     main_args,
-    #     logger,
-    #     learner,
-    #     task2args,
-    #     task2runner,
-    #     task2offlinedata,
-    # )
+    if main_args.load_wm_path != "":
+        learner.load_models(main_args.load_wm_path)
+    if getattr(main_args, "use_offline_training", False) and main_args.load_wm_path == "":
+        train_sequential(
+            main_args.train_tasks,
+            main_args,
+            logger,
+            learner,
+            task2args,
+            task2runner,
+            task2offlinedata,
+        )
 
-    # # save the final model
-    # if main_args.save_model:
-    #     save_path = os.path.join(main_args.save_dir, str(main_args.t_max))
-    #     os.makedirs(save_path, exist_ok=True)
-    #     logger.console_logger.info("Saving final models to {}".format(save_path))
-    #     learner.save_models(save_path)
+        # save the final model
+        if main_args.save_model:
+            save_path = os.path.join(main_args.save_dir, str(main_args.t_max))
+            os.makedirs(save_path, exist_ok=True)
+            logger.console_logger.info("Saving final models to {}".format(save_path))
+            learner.save_models(save_path)
 
     # Stage 2 : online training with hierarchical ma gumbel muzero
     if getattr(main_args, "use_online_mcts", False):

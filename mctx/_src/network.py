@@ -416,7 +416,7 @@ class PolicyRNN(nn.Module):
         combo_logits = gathered_logits.sum(dim=2)  # [B, num_agents]
         # Compute the policy loss. 这里是可以不使用去常数的logits的，因为experienced_thresholds是gumbel perturbed value，本身也包含常数，所以就消掉了
         experience_sample_probs = (1 - torch.exp(-torch.exp(combo_logits - experienced_thresholds))).detach()
-        print("experience_sample_probs.min = ", experience_sample_probs.min().detach().cpu().numpy())
+        # print("experience_sample_probs.min = ", experience_sample_probs.min().detach().cpu().numpy())
         normalized_factor = 1 + torch.sum(combo_probs * (torch.exp(transformed_advantages) - 1), axis=-1, keepdim=True)
         policy_prob_mpo = ((combo_probs * torch.exp(transformed_advantages) / normalized_factor)).detach()
         policy_loss = -torch.mean(torch.sum(policy_prob_mpo / (experience_sample_probs+1e-8) * torch.log(combo_probs + 1e-8), axis=-1))
@@ -575,19 +575,20 @@ def prepare_batch_data(sampled_batch: Tuple,
         action_weights = policy_output.action_weights
 
         root_idx = tree_lib.Tree.ROOT_INDEX
-        batch_idx = np.arange(tree.embeddings.shape[0])
+        batch_range = np.arange(tree.embeddings.shape[0])
 
         # sample data from the tree
         sampled_actions = to_np(tree.sampled_actions[:, root_idx])
-        visit_count = tree.children_visits[batch_idx, root_idx]
+        visit_count = tree.children_visits[batch_range, root_idx]
         max_visit = np.max(visit_count, axis=-1, keepdims=True)
         visit_scale = max_visit + max_visit_init
         transformed_adv = visit_scale * value_scale * advantage
         if not use_real_data:
+
             state_np = to_np(tree.embeddings[:, root_idx])
             obs_np = to_np(tree.observations[:, root_idx])
             reward_np = np.array([tree.children_rewards[b, root_idx, a]
-                                  for b, a in zip(batch_idx, action)])
+                                  for b, a in zip(batch_range, action)])
             next_state_np = np.array([tree.embeddings[br, tree.children_index[br, root_idx, a]] for br, a in zip(batch_range, action)])
             done_np = np.zeros_like(reward_np, dtype=bool)
 
@@ -618,9 +619,9 @@ def prepare_batch_data(sampled_batch: Tuple,
     states = np.concatenate(states, axis=0)
     observations = np.concatenate(observations, axis=0)
     actions = np.concatenate(actions, axis=0)
-    rewards = np.concatenate(rewards, axis=0)
+    rewards = np.concatenate(rewards, axis=0).flatten()
     next_states = np.concatenate(next_states, axis=0)
-    dones = np.concatenate(dones, axis=0)
+    dones = np.concatenate(dones, axis=0).flatten()
     experienced_thresholds = np.concatenate(experienced_thresholds, axis=0)
     improved_policy_probs = np.concatenate(improved_policy_probs, axis=0)
     policy_hidden_states = np.concatenate(policy_hidden_states, axis=0)

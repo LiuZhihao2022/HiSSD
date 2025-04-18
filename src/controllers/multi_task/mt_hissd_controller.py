@@ -105,11 +105,12 @@ class HISSDSMAC:
         )
 
         return agent_outs.reshape(ep_batch.batch_size * self.task2n_agents[task], 1, -1)
-    # 这个obs_emb应该是skill，名字有误导
+    # 这个obs_emb应该是skill，名字有误导.
     def forward_global_action(
         self, ep_batch, obs_emb, disrc_h, t, task, test_model=False
     ):
         bs = ep_batch.batch_size
+        # 得到基本动作，不用skill
         agent_inputs = self._build_inputs(ep_batch, t, task)
         # disrc_h = disrc_h.reshape(-1, 1, self.main_args.entity_embed_dim)
         act_out, self.hidden_states_dec, self.hidden_states_plan = (
@@ -131,6 +132,7 @@ class HISSDSMAC:
 
     def forward_value(self, ep_batch, t, task, test_mode=False, actions=None):
         bs = ep_batch.batch_size
+        # 这是得到具体value值的，所以build_inputs不加use_skill
         agent_inputs = self._build_inputs(ep_batch, t, task)
         agent_outs, self.hidden_states_value = self.agent.forward_value(
             agent_inputs, self.hidden_states_value, task, actions=actions
@@ -145,7 +147,7 @@ class HISSDSMAC:
         )
 
         return agent_outs.reshape(bs, self.task2n_agents[task], 1)
-
+    # 这个函数没使用
     def forward_seq_action(self, ep_batch, t, task, mask=False, test_model=False):
         agent_seq_inputs = []
         for i in range(self.c_step):
@@ -194,6 +196,7 @@ class HISSDSMAC:
         # 移除了return_pred参数及相关逻辑
         if t % self.c_step == 0 or hrl == False:
             # agent_inputs -> (bs*n_agents, input_shape)
+            # 这里是和skill相关，本来应该使用skill了，但是因为是offline dataset没有，只能使用基本动作
             agent_inputs = self._build_inputs(ep_batch, t, task)
             states = ep_batch["state"][:, t]
             next_inputs = None
@@ -242,6 +245,7 @@ class HISSDSMAC:
         return logits
 
     def forward(self, ep_batch, t, task, test_mode=False):
+        # TODO: 这个怎么用？
         agent_inputs = self._build_inputs(ep_batch, t, task)
         # 这里是通过skill得到具体的action，所以这里要使用ep_batch["avail_actions"]得到具体的action值，而不是avail_skills
         avail_actions = ep_batch["avail_actions"][:, t]
@@ -441,6 +445,7 @@ class HISSDSMAC:
         actions = th.where(actions >= 0, actions, zeros)
         return actions
 
+    # 那么其实就只有controller里的preprocess_obs要使用skill。只有它是完全独立的，和offline dataset/planner无关，其他的都有关，用不了
     def _build_inputs(self, batch, t, task, use_skill=False):
         """
         Builds the input tensor for the agents at a given time step.
@@ -687,8 +692,23 @@ class HISSDSMAC:
             
             # 预测下一步观察
             # batch_obs.reshape(-1, batch_obs_shape[-1])
+            # Split batch_obs into obs, last-action and agent-id parts
+            shape_info = self._get_input_shape()[task]
+            obs_dim = self.task2args[task].obs_shape
+            agent_id_shape = shape_info['agent_id_shape']
+
+            # batch_obs is [bs*n_agents, obs_dim + last_action + agent_id]
+            inputs = batch_obs
+            obs_inputs = inputs[:, :obs_dim]
+            
+            agent_id_inputs = inputs[:, -agent_id_shape:]
+
+            # concatenate obs and agent_id, drop last_action
+            obs_input = th.cat([obs_inputs, agent_id_inputs], dim=-1)
+
+            # call pred_next with the new input
             next_obs, next_state = self.agent.planner.rec_module.pred_next(
-                batch_obs, batch_state, all_skill, task
+                obs_input, batch_state, all_skill, task
             )
             one_hot_code = F.one_hot(skill_index.long(), num_classes=self.skill_dim).float()
             agent_id = th.eye(n_agents, device=self.device).unsqueeze(0).expand(bs, -1, -1)

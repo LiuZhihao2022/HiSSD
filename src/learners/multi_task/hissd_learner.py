@@ -196,6 +196,7 @@ class HISSDLearner:
         t = 0
         while t < batch.max_seq_length - self.c: # TODO:这里留出了接口，一次planner的技能选择可以指导c_time次底层动作选择. 是从skill重建动作，与原动作进行比对
             act_outs = []   # forward_planner的作用是提取skill，计算技能表示，forward_planner_feedforward的作用是根据技能表示计算特定任务的特征(action or value)
+            # 和技能相关，不是基本动作，本来是想用skill的。但是和forward_planner相关的输入，由于数据集里没有skill，在world_model_predict中也没有basic action，所以不能用这两个。
             agent_inputs = self.mac._build_inputs(batch, t=t, task=task)
             agent_outs, _, _ = self.mac.forward_planner(
                 batch, t=t, task=task, actions=actions[:, t], hrl=True, skill_index_out=False

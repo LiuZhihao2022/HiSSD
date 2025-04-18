@@ -82,7 +82,16 @@ class HISSDAgent(nn.Module):
         act, h_dec = self.decoder(emb_inputs, inputs, None, hidden_state_dec, task, mask, actions)
         # return act, h_dec, h_plan, cls_out
         return act, h_dec, hidden_state_plan
-
+    # 和forward_global_action作用相同，都是使用decoder得到动作。可以直接用。
+    # hidden_state_dis不使用，直接返回了。 好像没有函数用到这个啊？mac的forward_action_skill是直接使用了agent.forward?
+    def forward_action_skill(self, inputs, hidden_state_dec, hidden_state_dis, t, task, skill, 
+                                 mask=False, actions=None):
+        # 这个参数t其实没用上，在forward_discriminator里没有使用
+        # _, discr_h, h_dis = self.forward_discriminator(inputs, t, task, hidden_state_dis)
+        # discr_h  = discr_h.reshape(-1, 1, self.args.entity_embed_dim)
+        act, h_dec = self.decoder(skill, inputs, None, hidden_state_dec, task, mask, actions)
+        # return act, h_dec, h_dis
+        return act, h_dec, hidden_state_dis
     def forward_value(self, inputs, hidden_state_value, task, actions=None):
         attn_out, hidden_state_value = self.value(inputs, hidden_state_value, task)
         return attn_out, hidden_state_value
@@ -144,15 +153,6 @@ class HISSDAgent(nn.Module):
             return act, self.last_h_plan, h_dec, hidden_state_dis, None
         else:
             return act, self.last_h_plan, h_dec, hidden_state_dis, skill_index
-    # hidden_state_dis不使用，直接返回了。 好像没有函数用到这个啊？mac的forward_action_skill是直接使用了agent.forward?
-    def forward_action_skill(self, inputs, hidden_state_dec, hidden_state_dis, t, task, skill, 
-                                 mask=False, actions=None):
-        # 这个参数t其实没用上，在forward_discriminator里没有使用
-        # _, discr_h, h_dis = self.forward_discriminator(inputs, t, task, hidden_state_dis)
-        # discr_h  = discr_h.reshape(-1, 1, self.args.entity_embed_dim)
-        act, h_dec = self.decoder(skill, inputs, None, hidden_state_dec, task, mask, actions)
-        # return act, h_dec, h_dis
-        return act, h_dec, hidden_state_dis
     
     # TODO:测试一下reward是否输出形状合适
     def forward_reward_skill(self, inputs, hidden_state_reward, task=None):
@@ -907,11 +907,13 @@ class PlannerModel(nn.Module):
 
         # decompose inputs into observation inputs, last_action_info, agent_id_info
         obs_dim = task_decomposer.obs_dim
-        original_inputs = inputs.clone()
         obs_inputs, last_action_inputs, agent_id_inputs = inputs[:, :obs_dim], \
         inputs[:, obs_dim:obs_dim + last_action_shape], \
         inputs[:, obs_dim + last_action_shape:]
 
+        # original_inputs = inputs.clone()
+        # original_inputs是rec_module的输入，rec_module现在不加last_action了，所以这么设计
+        original_inputs  = th.cat([obs_inputs, agent_id_inputs], dim=-1).clone()
         # decompose observation input
         # enemy_feats是一个list，长度为enemy_num, 包含了所有敌方智能体的特征，ally_feats也是一个list，包含了所有友方智能体的特征
         own_obs, enemy_feats, ally_feats = task_decomposer.decompose_obs(
@@ -975,7 +977,7 @@ class PlannerModel(nn.Module):
         out_loss = th.tensor(0.).to(inputs.device)
         
         if next_inputs is not None and loss_out:
-            out_loss = self.rec_module([own_out, enemy_out, ally_out], original_inputs,next_inputs, states, next_states, 
+            out_loss = self.rec_module([own_out, enemy_out, ally_out], original_inputs, next_inputs, states, next_states, 
                                        task, t=t, actions=actions)
             out_loss += commit_loss
         
@@ -1211,7 +1213,8 @@ class MergeRec(nn.Module):
         self.obs_pred = nn.ModuleDict()
         self.state_pred = nn.ModuleDict()
         for task in task2input_shape_info:
-            input_shape = task2input_shape_info[task]['input_shape_skill']
+            # 只带id和OBSERVATION的输入
+            input_shape = task2input_shape_info[task]['input_shape'] - task2input_shape_info[task]['last_action_shape']
             n_enemies = self.task2decomposer[task].n_enemies
             n_agents = self.task2decomposer[task].n_agents
             obs_dim = self.task2decomposer[task].obs_dim
