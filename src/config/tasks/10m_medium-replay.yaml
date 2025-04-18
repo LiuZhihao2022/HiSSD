@@ -1,14 +1,14 @@
-dataset: 10m/medium-replay
+dataset: 10m/medium-medium-replay
 env: sc2
 pretrain_tasks:
-- 3m
+- 10m
 pretrain_tasks_data_quality:
-  3m: medium
-task: marine-easy-expert
+  10m: medium-replay
+task: marine-easy-medium-replay
 test_tasks:
-- 3m
+- 10m
 test_tasks_data_quality: {}
 train_tasks:
-- 3m
+- 10m
 train_tasks_data_quality:
-  3m: medium
+  10m: medium-replay

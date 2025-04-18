@@ -3,12 +3,12 @@ env: sc2
 pretrain_tasks:
 - 3m
 pretrain_tasks_data_quality:
-  3m: medium
-task: marine-easy-expert
+  3m: medium-replay
+task: marine-easy-medium-replay
 test_tasks:
 - 3m
 test_tasks_data_quality: {}
 train_tasks:
 - 3m
 train_tasks_data_quality:
-  3m: medium
+  3m: medium-replay

@@ -4,7 +4,7 @@ pretrain_tasks:
 - 10m
 pretrain_tasks_data_quality:
   10m: medium
-task: marine-easy-expert
+task: marine-easy-medium
 test_tasks:
 - 10m
 test_tasks_data_quality: {}

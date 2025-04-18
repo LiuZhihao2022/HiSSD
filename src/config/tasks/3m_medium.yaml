@@ -4,7 +4,7 @@ pretrain_tasks:
 - 3m
 pretrain_tasks_data_quality:
   3m: medium
-task: marine-easy-expert
+task: marine-easy-medium
 test_tasks:
 - 3m
 test_tasks_data_quality: {}
