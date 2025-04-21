@@ -5,7 +5,7 @@ import numpy as np
 
 # FROM policy_improvement_demo.py
 import sys
-sys.path.append('/home/liuzhihao/HiSSD')
+sys.path.append('/home/lzh/HiSSD')
 import functools
 from typing import Tuple, Optional
 import chex

@@ -2,7 +2,7 @@ import numpy as np
 import torch as th
 import copy
 import sys
-sys.path.append('/home/liuzhihao/HiSSD')
+sys.path.append('/home/lzh/HiSSD')
 import logging
 import pickle
 import cloudpickle
@@ -15,7 +15,7 @@ from components.episode_buffer import EpisodeBatch
 from multiprocessing import Pipe, Process
 
 # FROM policy_improvement_demo.py
-sys.path.append('/home/liuzhihao/HiSSD')
+sys.path.append('/home/lzh/HiSSD')
 from typing import Tuple, Optional
 from absl import app
 from absl import flags

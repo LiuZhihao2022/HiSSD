@@ -1,14 +1,14 @@
 dataset: 9m_vs_10m/medium
 env: sc2
 pretrain_tasks:
-- 3m
+- 9m_vs_10m
 pretrain_tasks_data_quality:
-  3m: medium
-task: marine-easy-expert
+  9m_vs_10m: medium
+task: marine-easy-medium
 test_tasks:
-- 3m
+- 9m_vs_10m
 test_tasks_data_quality: {}
 train_tasks:
-- 3m
+- 9m_vs_10m
 train_tasks_data_quality:
-  3m: medium
+  9m_vs_10m: medium

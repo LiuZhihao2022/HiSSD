@@ -17,7 +17,7 @@ import sys
 import os
 import time
 # sys.path.append('/Users/liuzhihao/Downloads/code/mctx-main')
-sys.path.append('/home/liuzhihao/HiSSD')
+sys.path.append('/home/lzh/HiSSD')
 # print(sys.path)
 import functools
 from typing import Tuple, Optional
