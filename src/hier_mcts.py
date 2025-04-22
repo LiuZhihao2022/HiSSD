@@ -700,8 +700,8 @@ def train_online_mcts(
         
         # 定期记录日志
         if (current_t_env - last_log_T) >= main_args.log_interval:
-            last_log_T = current_t_env
-            logger.log_stat("online_episode", episode, current_t_env)
+            last_log_T = current_t_env   
+            logger.log_stat("episode", episode, current_t_env)
             logger.print_recent_stats()
     
     # 保存最终模型

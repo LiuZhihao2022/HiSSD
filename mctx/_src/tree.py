@@ -17,8 +17,9 @@
 from __future__ import annotations
 from typing import Any, ClassVar, Generic, TypeVar
 import chex
-import numpy as np
 import jax
+import jax.numpy as jnp
+import numpy as np
 import torch
 
 T = TypeVar("T")
@@ -58,23 +59,23 @@ class Tree(Generic[T]):
   policy_hidden_states: torch.FloatTensor  # [B, N, num_agents, hidden_dim]
   critic_hidden_states: torch.FloatTensor  # [B, N, hidden_dim]
   """
-  node_visits: np.ndarray  # [B, N]
-  raw_values: np.ndarray  # [B, N]
-  node_values: np.ndarray  # [B, N]
-  parents: np.ndarray  # [B, N]
-  action_from_parent: np.ndarray  # [B, N]
-  children_index: np.ndarray  # [B, N, num_actions]
-  children_prior_logits: np.ndarray  # [B, N, num_actions]
-  children_visits: np.ndarray  # [B, N, num_actions]
-  children_rewards: np.ndarray  # [B, N, num_actions]
-  children_discounts: np.ndarray  # [B, N, num_actions]
-  children_values: np.ndarray  # [B, N, num_actions]
+  node_visits: jnp.ndarray  # [B, N]
+  raw_values: jnp.ndarray  # [B, N]
+  node_values: jnp.ndarray  # [B, N]
+  parents: jnp.ndarray  # [B, N]
+  action_from_parent: jnp.ndarray  # [B, N]
+  children_index: jnp.ndarray  # [B, N, num_actions]
+  children_prior_logits: jnp.ndarray  # [B, N, num_actions]
+  children_visits: jnp.ndarray  # [B, N, num_actions]
+  children_rewards: jnp.ndarray  # [B, N, num_actions]
+  children_discounts: jnp.ndarray  # [B, N, num_actions]
+  children_values: jnp.ndarray  # [B, N, num_actions]
   embeddings: Any  # [B, N, ...]
-  observations: np.ndarray  # [B, N, num_agents, ...]
-  sampled_actions: np.ndarray  # [B, N, k]
-  root_invalid_actions: np.ndarray  # [B, num_actions]
+  observations: jnp.ndarray  # [B, N, num_agents, ...]
+  sampled_actions: jnp.ndarray  # [B, N, k]
+  root_invalid_actions: jnp.ndarray  # [B, num_actions]
   extra_data: T  # [B, ...]
-  sampled_actions: np.ndarray  # [B, k]
+  sampled_actions: jnp.ndarray  # [B, k]
   policy_hidden_states: torch.FloatTensor  # [B, N, hidden_dim]
   critic_hidden_states: torch.FloatTensor  # [B, N, hidden_dim]
   # TODO: check，wm里面是一个list而不是单纯的tensor
@@ -95,29 +96,18 @@ class Tree(Generic[T]):
 
   def qvalues(self, indices):
     """Compute q-values for any node indices in the tree."""
-    # if np.asarray(indices).shape:
-    #   return np.vectorize(_unbatched_qvalues)(self, indices)
-    # else:
     return _unbatched_qvalues(self, indices)
-  # def qvalues(self, indices):
-  #   """Compute q-values for any node indices in the tree."""
-  #   # pytype: disable=wrong-arg-types  # jnp-type
-  #   if np.array(indices).shape:
-  #     return jax.vmap(_unbatched_qvalues)(self, indices)
-  #   else:
-  #     return _unbatched_qvalues(self, indices)
     
   def summary(self) -> SearchSummary:
     """Extract summary statistics for the root node."""
     value = self.node_values[:, Tree.ROOT_INDEX]
     batch_size, = value.shape
-    root_indices = np.full((batch_size,), Tree.ROOT_INDEX)
+    root_indices = jnp.full((batch_size,), Tree.ROOT_INDEX)
     qvalues = self.qvalues(root_indices)
     visit_counts = self.children_visits[:, Tree.ROOT_INDEX].astype(value.dtype)
-    total_counts = np.sum(visit_counts, axis=-1, keepdims=True)
-    # 这里计算了访问概率。但是这个概率并不是gumble muzero中的改善策略的访问概率呀？
-    visit_probs = visit_counts / np.maximum(total_counts, 1)
-    visit_probs = np.where(total_counts > 0, visit_probs, 1 / self.num_actions)
+    total_counts = jnp.sum(visit_counts, axis=-1, keepdims=True)
+    visit_probs = visit_counts / jnp.maximum(total_counts, 1)
+    visit_probs = jnp.where(total_counts > 0, visit_probs, 1 / self.num_actions)
     return SearchSummary(
         visit_counts=visit_counts,
         visit_probs=visit_probs,
@@ -128,7 +118,7 @@ class Tree(Generic[T]):
     """返回只包含单个batch数据的新Tree对象。"""
     # 只取batch_idx对应的那一行/切片
     def _slice(x):
-      if isinstance(x, np.ndarray) or (hasattr(x, 'shape') and hasattr(x, '__getitem__')):
+      if isinstance(x, (jnp.ndarray, np.ndarray)) or (hasattr(x, 'shape') and hasattr(x, '__getitem__')):
         if x.shape[0] == self.node_values.shape[0]:
           return x[batch_idx:batch_idx+1]
         return x
@@ -165,14 +155,13 @@ def infer_batch_size(tree: Tree) -> int:
 @chex.dataclass(frozen=True)
 class SearchSummary:
   """Stats from MCTS search."""
-  visit_counts: np.ndarray
-  visit_probs: np.ndarray
-  value: np.ndarray
-  qvalues: np.ndarray
+  visit_counts: jnp.ndarray
+  visit_probs: jnp.ndarray
+  value: jnp.ndarray
+  qvalues: jnp.ndarray
 
 
 def _unbatched_qvalues(tree: Tree, index: tuple) -> int:
-  # chex.assert_rank(tree.children_discounts, 2)
   return (
       tree.children_rewards[index]
       + tree.children_discounts[index] * tree.children_values[index]

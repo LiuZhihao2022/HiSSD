@@ -29,6 +29,68 @@ Tree = tree_lib.Tree
 T = TypeVar("T")
 
 
+def simulate(
+    tree: Tree,
+    action_selection_fn: base.InteriorActionSelectionFn,
+    max_depth: int) -> Tuple[chex.Array, chex.Array]:
+    """Traverses the tree until reaching an unvisited action or `max_depth`.
+
+    Each simulation starts from the root and keeps selecting actions traversing
+    the tree until a leaf or `max_depth` is reached.
+
+    Args:
+      rng_key: random number generator state, the key is consumed.
+      tree: _unbatched_ MCTS tree state.
+      action_selection_fn: function used to select an action during simulation.
+      max_depth: maximum search tree depth allowed during simulation.
+
+    Returns:
+      `(parent_index, action)` tuple, where `parent_index` is the index of the
+      node reached at the end of the simulation, and the `action` is the action to
+      evaluate from the `parent_index`.
+    """
+    def cond_fun(state):
+        return state.is_continuing
+
+    def body_fun(state):
+        # Preparing the next simulation state.
+        node_index = state.next_node_index
+        action = action_selection_fn(None, tree, node_index,
+                                     state.depth)
+        next_node_index = tree.children_index[node_index, action]
+        # The returned action will be visited.
+        depth = state.depth + 1
+        is_before_depth_cutoff = depth < max_depth
+        is_visited = next_node_index != Tree.UNVISITED
+        is_continuing = jnp.logical_and(is_visited, is_before_depth_cutoff)
+        return _SimulationState(  # pytype: disable=wrong-arg-types  # jax-types
+            node_index=node_index,
+            action=action,
+            next_node_index=next_node_index,
+            depth=depth,
+            is_continuing=is_continuing)
+
+    node_index = jnp.array(Tree.ROOT_INDEX, dtype=jnp.int32)
+    depth = jnp.zeros((), dtype=tree.children_prior_logits.dtype)
+    # pytype: disable=wrong-arg-types  # jnp-type
+    initial_state = _SimulationState(
+        node_index=tree.NO_PARENT,
+        action=tree.NO_PARENT,
+        next_node_index=node_index,
+        depth=depth,
+        is_continuing=jnp.array(True))
+    # pytype: enable=wrong-arg-types
+    end_state = jax.lax.while_loop(cond_fun, body_fun, initial_state)
+
+    # Returning a node with a selected action.
+    # The action can be already visited, if the max_depth is reached.
+    return end_state.node_index, end_state.action
+
+
+# 使用jax.vmap和jax.jit分别应用到simulate
+simulated_fn = functools.partial(jax.vmap, in_axes=[0, None, None], out_axes=0)(simulate)
+simulated_fn = jax.jit(simulated_fn, static_argnums=(1, 2))
+
 def search(
     params: base.Params,
     rng_key: np.random.RandomState,
@@ -85,11 +147,11 @@ def search(
   )
 
   batch_size = root.value.shape[0]
-  batch_range = np.arange(batch_size)
+  batch_range = jnp.arange(batch_size)
   if max_depth is None:
     max_depth = num_simulations
   if invalid_actions is None:
-    invalid_actions = np.zeros_like(root.prior_logits)
+    invalid_actions = jnp.zeros_like(root.prior_logits)
 
   # 初始化时间统计
   timing_stats = {
@@ -103,11 +165,11 @@ def search(
     
     # Simulate timing
     sim_start = time.time()
-    parent_index, action = simulate(tree, action_selection_fn ,max_depth)
+    parent_index, action = simulated_fn(tree, action_selection_fn ,max_depth)
     timing_stats['simulate_time'] += time.time() - sim_start
     
     next_node_index = tree.children_index[batch_range, parent_index, action]
-    next_node_index = np.where(next_node_index == Tree.UNVISITED, sim + 1, next_node_index)
+    next_node_index = jnp.where(next_node_index == Tree.UNVISITED, sim + 1, next_node_index)
     
     # Expand timing
     expand_start = time.time()
@@ -137,65 +199,7 @@ class _SimulationState(NamedTuple):
   next_node_index: int
   depth: int
   is_continuing: bool
-  
-@functools.partial(jax.vmap, in_axes=[0, None, None], out_axes=0)
-def simulate(
-    tree: Tree,
-    action_selection_fn: base.InteriorActionSelectionFn,
-    max_depth: int) -> Tuple[chex.Array, chex.Array]:
-  """Traverses the tree until reaching an unvisited action or `max_depth`.
-
-  Each simulation starts from the root and keeps selecting actions traversing
-  the tree until a leaf or `max_depth` is reached.
-
-  Args:
-    rng_key: random number generator state, the key is consumed.
-    tree: _unbatched_ MCTS tree state.
-    action_selection_fn: function used to select an action during simulation.
-    max_depth: maximum search tree depth allowed during simulation.
-
-  Returns:
-    `(parent_index, action)` tuple, where `parent_index` is the index of the
-    node reached at the end of the simulation, and the `action` is the action to
-    evaluate from the `parent_index`.
-  """
-  def cond_fun(state):
-    return state.is_continuing
-
-  def body_fun(state):
-    # Preparing the next simulation state.
-    node_index = state.next_node_index
-    action = action_selection_fn(None, tree, node_index,
-                                 state.depth)
-    next_node_index = tree.children_index[node_index, action]
-    # The returned action will be visited.
-    depth = state.depth + 1
-    is_before_depth_cutoff = depth < max_depth
-    is_visited = next_node_index != Tree.UNVISITED
-    is_continuing = jnp.logical_and(is_visited, is_before_depth_cutoff)
-    return _SimulationState(  # pytype: disable=wrong-arg-types  # jax-types
-        node_index=node_index,
-        action=action,
-        next_node_index=next_node_index,
-        depth=depth,
-        is_continuing=is_continuing)
-
-  node_index = jnp.array(Tree.ROOT_INDEX, dtype=jnp.int32)
-  depth = jnp.zeros((), dtype=tree.children_prior_logits.dtype)
-  # pytype: disable=wrong-arg-types  # jnp-type
-  initial_state = _SimulationState(
-      node_index=tree.NO_PARENT,
-      action=tree.NO_PARENT,
-      next_node_index=node_index,
-      depth=depth,
-      is_continuing=jnp.array(True))
-  # pytype: enable=wrong-arg-types
-  end_state = jax.lax.while_loop(cond_fun, body_fun, initial_state)
-
-  # Returning a node with a selected action.
-  # The action can be already visited, if the max_depth is reached.
-  return end_state.node_index, end_state.action
-
+  # 
 def expand(
     params: np.ndarray,
     tree: Tree[T],
@@ -226,10 +230,9 @@ def expand(
     tree: updated MCTS tree state.
   """
   batch_size = tree_lib.infer_batch_size(tree)
-  batch_range = np.arange(batch_size)
-  parent_index = np.array(parent_index)
-  action = np.array(action)
-  # TODO: 能否通过这个函数直接得到last_action?
+  batch_range = jnp.arange(batch_size)
+  parent_index = jnp.array(parent_index)
+  action = jnp.array(action)
   corresponding_joint_action = jax.vmap(extract_actions, in_axes=(0, 0, 0))(tree.sampled_actions, action, parent_index)
   chex.assert_shape([parent_index, action, next_node_index], (batch_size,))
   state = jax.tree_util.tree_map(
@@ -245,39 +248,24 @@ def expand(
   wm_hidden_states = jax.tree_util.tree_map(
       lambda x: x[batch_range, parent_index], tree.wm_hidden_states)
 
-  # # 获取父节点的父节点索引
-  # parent_parent_index = jax.tree_util.tree_map(
-  #     lambda x: x[batch_range, parent_index], tree.parents)
-  
-  # # 获取父节点的动作
-  # action_from_parent_parent = jax.tree_util.tree_map(
-  #     lambda x: x[batch_range, parent_index], tree.action_from_parent)
+  # --- 关键修改：转换为 numpy，供 PyTorch 网络使用 ---
+  state_np = jax.tree_util.tree_map(np.array, state)
+  observation_np = jax.tree_util.tree_map(np.array, observation)
+  policy_hidden_states_np = jax.tree_util.tree_map(np.array, policy_hidden_states)
+  critic_hidden_states_np = jax.tree_util.tree_map(np.array, critic_hidden_states)
+  wm_hidden_states_np = jax.tree_util.tree_map(np.array, wm_hidden_states)
+  corresponding_joint_action_np = np.array(corresponding_joint_action)
 
-  # # 获取sampled_actions
-  # sampled_actions = jax.tree_util.tree_map(
-  #     lambda x: x[batch_range, parent_parent_index], tree.sampled_actions)
-  
-  # n_agents = sampled_actions.shape[-1]
+  # 调用 recurrent_fn (PyTorch 网络)
+  step, next_embedding, next_observation = recurrent_fn(
+      params, None, corresponding_joint_action_np, observation_np, state_np,
+      policy_hidden_states_np, critic_hidden_states_np, wm_hidden_states_np, task, current_t_env)
 
-  # # 如果 action_from_parent 的形状为 (1,)，则将其转换为 (1, 1)
-  # if action_from_parent_parent.ndim == 1:
-  #   action_from_parent_parent = np.expand_dims(action_from_parent_parent, axis=1)  # [bs, n]
+  # --- 关键修改：输出转换为 jnp ---
+  step = jax.tree_util.tree_map(jnp.array, step)
+  next_embedding = jax.tree_util.tree_map(jnp.array, next_embedding)
+  next_observation = jax.tree_util.tree_map(jnp.array, next_observation)
 
-  # # 创建掩码，处理action_from_parent_parent中的-1
-  # # 对于action_from_parent_parent中的-1处理，创建掩码
-  # invalid_mask = (action_from_parent_parent == -1)
-  # extended_sampled_actions = np.concatenate([sampled_actions, np.full((batch_size, 1, n_agents), -1)], axis=1)
-  # # 使用 np.take_along_axis 来按照第二维进行索引
-  # # 通过 action_from_parent_parent 作为索引选择对应的 sampled_actions
-  # indexed_actions = np.take_along_axis(extended_sampled_actions, action_from_parent_parent[..., None], axis=1)
-
-  state = np.array(state)
-  observation = np.array(observation)
-  policy_hidden_states = np.array(policy_hidden_states)
-  critic_hidden_states = np.array(critic_hidden_states)
-  # step, next_embedding, next_observation = recurrent_fn(params, None, corresponding_joint_action, indexed_actions, observation, policy_hidden_states, critic_hidden_states, wm_hidden_states, task)
-  step, next_embedding, next_observation = recurrent_fn(params, None, corresponding_joint_action, observation, state, policy_hidden_states, critic_hidden_states, wm_hidden_states, task, current_t_env)
-  # TODO: 这里解包后还需要改改
   chex.assert_shape(step.prior_logits, [batch_size, tree.num_actions])
   chex.assert_shape(step.reward, [batch_size])
   chex.assert_shape(step.discount, [batch_size])
@@ -297,6 +285,7 @@ def expand(
           tree.action_from_parent, action, next_node_index))
 
 @jax.vmap
+@jax.jit
 def backward(
     tree: Tree[T],
     leaf_index: chex.Numeric) -> Tree[T]:
@@ -360,23 +349,6 @@ batch_update = jax.vmap(update)
 def extract_actions(tree_sampled_actions, action, parent_index):
     return tree_sampled_actions[parent_index, action]
 
-# def batch_update(xs, vals, indices):
-#     """
-#     Batch updates multiple inputs along axis=0.
-
-#     Args:
-#         xs: array-like, shape (batch_size, ...)
-#         vals: array-like, shape (batch_size, num_updates)
-#         indices: array-like, shape (batch_size, ...)
-
-#     Returns:
-#         Updated array `xs` with the same shape.
-#     """
-#     batch_size = xs.shape[0]
-#     batch_indices = np.arange(batch_size)[:, None]  # Batch index for each update
-#     xs[batch_indices, indices] = vals
-#     return xs
-
 def update_tree_node(
     tree: Tree[T],
     node_index: np.ndarray,
@@ -390,7 +362,7 @@ def update_tree_node(
     sampled_actions: np.ndarray) -> Tree[T]:
   """Updates the tree at node index."""
   batch_size = tree_lib.infer_batch_size(tree)
-  batch_range = np.arange(batch_size)
+  batch_range = jnp.arange(batch_size)
   chex.assert_shape(prior_logits, (batch_size, tree.num_actions))
   new_visit = tree.node_visits[batch_range, node_index] + 1
   updates = dict(
@@ -433,36 +405,36 @@ def instantiate_tree_from_root(
   batch_node_action = (batch_size, num_nodes, num_actions)
 
   def _zeros(x):
-    return np.zeros(batch_node + x.shape[1:], dtype=x.dtype)
+    return jnp.zeros(batch_node + x.shape[1:], dtype=x.dtype)
 
   tree = Tree(
-      node_visits=np.zeros(batch_node, dtype=np.int32),
-      raw_values=np.zeros(batch_node, dtype=data_dtype),
-      node_values=np.zeros(batch_node, dtype=data_dtype),
-      parents=np.full(batch_node, Tree.NO_PARENT, dtype=np.int32),
-      action_from_parent=np.full(
-          batch_node, Tree.NO_PARENT, dtype=np.int32),
-      children_index=np.full(
-          batch_node_action, Tree.UNVISITED, dtype=np.int32),
-      children_prior_logits=np.zeros(
+      node_visits=jnp.zeros(batch_node, dtype=jnp.int32),
+      raw_values=jnp.zeros(batch_node, dtype=data_dtype),
+      node_values=jnp.zeros(batch_node, dtype=data_dtype),
+      parents=jnp.full(batch_node, Tree.NO_PARENT, dtype=jnp.int32),
+      action_from_parent=jnp.full(
+          batch_node, Tree.NO_PARENT, dtype=jnp.int32),
+      children_index=jnp.full(
+          batch_node_action, Tree.UNVISITED, dtype=jnp.int32),
+      children_prior_logits=jnp.zeros(
           batch_node_action, dtype=root.prior_logits.dtype),
-      children_values=np.zeros(batch_node_action, dtype=data_dtype),
-      children_visits=np.zeros(batch_node_action, dtype=np.int32),
-      children_rewards=np.zeros(batch_node_action, dtype=data_dtype),
-      children_discounts=np.zeros(batch_node_action, dtype=data_dtype),
+      children_values=jnp.zeros(batch_node_action, dtype=data_dtype),
+      children_visits=jnp.zeros(batch_node_action, dtype=jnp.int32),
+      children_rewards=jnp.zeros(batch_node_action, dtype=data_dtype),
+      children_discounts=jnp.zeros(batch_node_action, dtype=data_dtype),
       embeddings=jax.tree_util.tree_map(_zeros, root.embedding),
       observations=jax.tree_util.tree_map(_zeros, root.observation),
       root_invalid_actions=root_invalid_actions,
       extra_data=extra_data,
       # 最后一个维度才和agent的数目有关
-      sampled_actions=np.zeros((batch_size, num_nodes, num_actions, num_agents), dtype=np.int32),
-      policy_hidden_states=np.zeros((batch_size, num_nodes, num_agents, root.new_policy_hidden_states.shape[-1]), dtype=np.float32),
-      critic_hidden_states=np.zeros((batch_size, num_nodes, root.new_critic_hidden_states.shape[-1]), dtype=np.float32),
+      sampled_actions=jnp.zeros((batch_size, num_nodes, num_actions, num_agents), dtype=jnp.int32),
+      policy_hidden_states=jnp.zeros((batch_size, num_nodes, num_agents, root.new_policy_hidden_states.shape[-1]), dtype=jnp.float32),
+      critic_hidden_states=jnp.zeros((batch_size, num_nodes, root.new_critic_hidden_states.shape[-1]), dtype=jnp.float32),
       # 这里的wm_hidden_states包含两项，reward和value，所以有一个2
-      wm_hidden_states=np.zeros((batch_size, num_nodes, 2, num_agents, root.new_wm_hidden_states.shape[-1]), dtype=np.float32),
+      wm_hidden_states=jnp.zeros((batch_size, num_nodes, 2, num_agents, root.new_wm_hidden_states.shape[-1]), dtype=jnp.float32),
   )
 
-  root_index = np.full([batch_size], Tree.ROOT_INDEX)
+  root_index = jnp.full([batch_size], Tree.ROOT_INDEX)
   tree = update_tree_node(
       tree, root_index, root.prior_logits, root.value, root.embedding, root.observation, root.new_policy_hidden_states, root.new_critic_hidden_states, root.new_wm_hidden_states, root.sampled_actions)
   return tree

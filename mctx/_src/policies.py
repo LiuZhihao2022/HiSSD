@@ -102,7 +102,7 @@ def gumbel_muzero_policy(
     args,
     invalid_actions: Optional[np.ndarray] = None,
     max_depth: Optional[int] = None,
-    loop_fn: base.LoopFn = None,
+    loop_fn: base.LoopFn = jax.lax.fori_loop,
     *,
     qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
     max_num_considered_actions: int = 16,
@@ -154,8 +154,8 @@ def gumbel_muzero_policy(
       prior_logits=_mask_invalid_actions(root.prior_logits, invalid_actions))
 
   # Generating Gumbel.
-  rng_key, gumbel_rng = np.random.RandomState(), np.random.RandomState()
-  gumbel = gumbel_scale * np.random.gumbel(size=root.prior_logits.shape)
+  rng_key, subkey = jax.random.split(rng_key)
+  gumbel = gumbel_scale * jax.random.gumbel(subkey, shape=root.prior_logits.shape)
 
   # Searching.
   extra_data = action_selection.GumbelMuZeroExtraData(root_gumbel=gumbel)
@@ -191,7 +191,7 @@ def gumbel_muzero_policy(
   # a smaller number of valid actions.
   considered_visit = jnp.max(summary.visit_counts, axis=-1, keepdims=True)
   # The completed_qvalues include imputed values for unvisited actions.
-  completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(  # pytype: disable=wrong-arg-types  # numpy-scalars  # pylint: disable=line-too-long
+  completed_qvalues = jax.vmap(qtransform, in_axes=[0, None])(
       search_tree, search_tree.ROOT_INDEX)
   to_argmax = seq_halving.score_considered(
       considered_visit, gumbel, root.prior_logits, completed_qvalues,
@@ -199,9 +199,9 @@ def gumbel_muzero_policy(
   # 这里的action只是sampled_actions里的序号。还需要使用这个action将sampled_actions进行解码
   action = action_selection.masked_argmax(to_argmax, invalid_actions)
   batch_size = infer_batch_size(search_tree)
-  node_index = np.full([batch_size], search_tree.ROOT_INDEX)
+  node_index = jnp.full([batch_size], search_tree.ROOT_INDEX)
   advantages = compute_advantage(search_tree, node_index)
-  batch_range = np.arange(batch_size)
+  batch_range = jnp.arange(batch_size)
   chosen_skill = jax.tree_util.tree_map(
       lambda x: x[batch_range, search_tree.ROOT_INDEX, action], search_tree.sampled_actions)
 
@@ -221,7 +221,7 @@ def gumbel_muzero_policy(
       action=action,
       chosen_skill = chosen_skill,
       action_weights=action_weights,
-      search_tree=search_tree), timing_stats, advantages, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states
+      search_tree=search_tree), timing_stats, advantages, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states, rng_key
 
 
 def stochastic_muzero_policy(
