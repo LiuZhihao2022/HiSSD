@@ -25,6 +25,7 @@ import chex
 from absl import app
 from absl import flags
 import numpy as np
+import jax.numpy as jnp
 import torch
 import gym
 import mctx
@@ -115,6 +116,16 @@ def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=F
     value, new_critic_hidden_states = network.predict_value(state, critic_hidden_states)
     value = value.detach().cpu().numpy().flatten()
     new_critic_hidden_states = new_critic_hidden_states.detach().cpu().numpy()
+    # --- 转换为 jnp ---
+    prior_logits = jnp.array(prior_logits)
+    value = jnp.array(value)
+    state = jnp.array(state)
+    observation = jnp.array(observation)
+    new_policy_hidden_states = jnp.array(new_policy_hidden_states)
+    new_critic_hidden_states = jnp.array(new_critic_hidden_states)
+    if wm_hidden_states is not None:
+        wm_hidden_states = jnp.array(wm_hidden_states)
+    sampled_actions = jnp.array(sampled_actions)
     root = mctx.RootFnOutput(
         prior_logits=prior_logits,
         value=value,
