@@ -447,6 +447,7 @@ class HierMCTSParallelRunner:
         # selected_policy_hidden_states = new_policy_hidden_states[env_indices]
         # selected_critic_hidden_states = new_critic_hidden_states[env_indices]
         # return skill_indices, mcts_datas, selected_wm_hidden_states, selected_policy_hidden_states, selected_critic_hidden_states
+        skill_indices = np.array(skill_indices).reshape(len(env_indices), -1)
         return skill_indices, mcts_datas, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states
 
 
