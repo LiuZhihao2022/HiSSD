@@ -210,7 +210,8 @@ def gumbel_muzero_policy(
   child_indices = search_tree.children_index[batch_range, search_tree.ROOT_INDEX, action]  # [B]
   # wm_hidden_states: [B, N, ...]
   new_wm_hidden_states = search_tree.wm_hidden_states[batch_range, child_indices]
-
+  new_policy_hidden_states = search_tree.policy_hidden_states[batch_range, child_indices]
+  new_critic_hidden_states = search_tree.critic_hidden_states[batch_range, child_indices]
   # Producing action_weights usable to train the policy network.
   completed_search_logits = _mask_invalid_actions(
       root.prior_logits + completed_qvalues, invalid_actions)
@@ -220,7 +221,7 @@ def gumbel_muzero_policy(
       action=action,
       chosen_skill = chosen_skill,
       action_weights=action_weights,
-      search_tree=search_tree), timing_stats, advantages, new_wm_hidden_states
+      search_tree=search_tree), timing_stats, advantages, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states
 
 
 def stochastic_muzero_policy(

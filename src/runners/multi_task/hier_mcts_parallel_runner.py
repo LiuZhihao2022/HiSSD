@@ -196,7 +196,7 @@ class HierMCTSParallelRunner:
                 if episode_lengths[idx] % self.c_step == 0:
                     skill_select_envs.append(idx)
             if not pretrain and skill_select_envs:
-                skill_indices, mcts_datas, new_wm_hidden_states = self._batch_select_skill_with_mcts(skill_select_envs)
+                skill_indices, mcts_datas, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states = self._batch_select_skill_with_mcts(skill_select_envs)
                 for i, env_idx in enumerate(skill_select_envs):
                     if self.current_mcts_data[env_idx] is not None and episode_lengths[env_idx] > 0:
                         current_input = self.mac._build_inputs(self.batch[env_idx], t=self.t, task=self.task, use_skill=True).reshape(1, self.n_agents, -1)
@@ -217,7 +217,10 @@ class HierMCTSParallelRunner:
                     self.current_skill_indices[env_idx] = skill_indices[i]
                     self.current_mcts_data[env_idx] = mcts_datas[i]
                     self.last_skill_selection_t[env_idx] = episode_lengths[env_idx]
-                    self.wm_hidden_states[env_idx] = new_wm_hidden_states[i]
+                    # 全部赋值影响不大。因为各个不同的batch之间的hidden state都是相互不影响的
+                    self.wm_hidden_states = new_wm_hidden_states
+                    self.mcts_network.policy_hidden = new_policy_hidden_states
+                    self.mcts_network.critic_hidden = new_critic_hidden_states
 
             # 2. 批量动作选择
             if pretrain:
@@ -380,12 +383,12 @@ class HierMCTSParallelRunner:
 
     def _batch_select_skill_with_mcts(self, env_indices):
         # env_indices: 需要新skill的环境下标
-        batch_size = len(env_indices)
-        # 构造batch输入
+        batch_size = self.batch_size  # 使用所有环境
+        # 构造batch输入（全部环境）
         state_inputs = []
         obs_inputs = []
         wm_hidden_states = []
-        for idx in env_indices:
+        for idx in range(self.batch_size):
             state = self.batch["state"][idx:idx+1, self.t].reshape(1, -1).cpu().numpy()
             obs = self.mac.preprocess_obs(self.batch[idx], self.t, self.task, use_skill=True).cpu().numpy()
             state_inputs.append(state)
@@ -404,10 +407,10 @@ class HierMCTSParallelRunner:
             self.n_agents,
             self.args.skill_dim,
             wm_hidden_states=wm_hidden_states,
-            bs_id=env_indices,
+            bs_id=list(range(self.batch_size)),
         )
         # 批量运行MCTS
-        policy_output, timing_stats, advantages, new_wm_hidden_states = mctx.gumbel_muzero_policy(
+        policy_output, timing_stats, advantages, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states = mctx.gumbel_muzero_policy(
             params=(),
             rng_key=np.random.RandomState(),
             root=roots,
@@ -423,21 +426,29 @@ class HierMCTSParallelRunner:
                 use_mixed_value=self.use_mixed_value,
             ),
         )
-        # policy_output等为batch结构
-        skill_indices = policy_output.chosen_skill  # [B]
-        # 按batch拆分
+        # 只挑选env_indices对应的结果
+        skill_indices = []  # [len(env_indices)]
         mcts_datas = []
         new_wm_hidden_states = th.tensor(np.array(new_wm_hidden_states)).to(self.args.device)
-        for i in range(batch_size):
+        new_policy_hidden_states = th.tensor(np.array(new_policy_hidden_states)).to(self.args.device)
+        new_critic_hidden_states = th.tensor(np.array(new_critic_hidden_states)).to(self.args.device)
+        for i, idx in enumerate(env_indices):
+            # 这里的skill_indices是一个一维数组，长度为1
+            skill_indices.append(policy_output[idx].chosen_skill)
             mcts_datas.append((
-                policy_output[i],
-                experienced_thresholds[i:i+1],
-                advantages[i:i+1],
-                root_policy_hidden_states[i:i+1],
-                root_critic_hidden_states[i:i+1]
+                policy_output[idx],
+                experienced_thresholds[idx:idx+1],
+                advantages[idx:idx+1],
+                root_policy_hidden_states[idx:idx+1],
+                root_critic_hidden_states[idx:idx+1]
             ))
-            # TODO: skill_indices对应的节点的wm_hidden_states作为new_wm_hidden_states
-        return skill_indices, mcts_datas, new_wm_hidden_states
+    
+        # selected_wm_hidden_states = new_wm_hidden_states[env_indices]
+        # selected_policy_hidden_states = new_policy_hidden_states[env_indices]
+        # selected_critic_hidden_states = new_critic_hidden_states[env_indices]
+        # return skill_indices, mcts_datas, selected_wm_hidden_states, selected_policy_hidden_states, selected_critic_hidden_states
+        return skill_indices, mcts_datas, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states
+
 
     def _log(self, returns, stats, prefix):
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)
