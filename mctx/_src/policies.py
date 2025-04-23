@@ -96,6 +96,7 @@ def gumbel_muzero_policy(
     rng_key: np.random.RandomState,
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
+    action_selection_fn,
     num_simulations: int,
     task: str,
     current_t_env: int,
@@ -165,6 +166,7 @@ def gumbel_muzero_policy(
       rng_key=rng_key,
       root=root,
       recurrent_fn=recurrent_fn,
+      action_selection_fn=action_selection_fn,
       root_action_selection_fn=functools.partial(
           action_selection.gumbel_muzero_root_action_selection,
           num_simulations=num_simulations,

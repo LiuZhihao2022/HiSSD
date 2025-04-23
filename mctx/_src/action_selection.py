@@ -94,14 +94,14 @@ GumbelMuZeroExtraDataType = TypeVar("GumbelMuZeroExtraDataType", bound=GumbelMuZ
 
 
 def gumbel_muzero_root_action_selection(
-    indice: int,
+    rng_key: chex.PRNGKey,
     tree: tree_lib.Tree[GumbelMuZeroExtraDataType],
-    node_index: int,
+    node_index: chex.Numeric,
     *,
-    num_simulations: int,
-    max_num_considered_actions: int,
+    num_simulations: chex.Numeric,
+    max_num_considered_actions: chex.Numeric,
     qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
-) -> np.ndarray:
+) -> chex.Array:
   """Returns the action selected by Sequential Halving with Gumbel.
 
   Initially, we sample `max_num_considered_actions` actions without replacement.
@@ -120,6 +120,7 @@ def gumbel_muzero_root_action_selection(
   Returns:
     action: the action selected from the given node.
   """
+  del rng_key
   chex.assert_shape([node_index], ())
   visit_counts = tree.children_visits[node_index]
   prior_logits = tree.children_prior_logits[node_index]
@@ -148,13 +149,13 @@ def gumbel_muzero_root_action_selection(
 
 
 def gumbel_muzero_interior_action_selection(
-    indice: NotImplementedError,
+    rng_key: chex.PRNGKey,
     tree: tree_lib.Tree,
-    node_index: int,
-    depth: int,
+    node_index: chex.Numeric,
+    depth: chex.Numeric,
     *,
     qtransform: base.QTransform = qtransforms.qtransform_completed_by_mix_value,
-) -> np.ndarray:
+) -> chex.Array:
   """Selects the action with a deterministic action selection.
 
   The action is selected based on the visit counts to produce visitation
@@ -170,6 +171,7 @@ def gumbel_muzero_interior_action_selection(
   Returns:
     action: the action selected from the given node.
   """
+  del rng_key, depth
   chex.assert_shape([node_index], ())
   visit_counts = tree.children_visits[node_index]
   prior_logits = tree.children_prior_logits[node_index]
@@ -185,6 +187,7 @@ def gumbel_muzero_interior_action_selection(
 
   chex.assert_rank(to_argmax, 1)
   return jnp.argmax(to_argmax, axis=-1).astype(jnp.int32)
+
 
 
 def masked_argmax(

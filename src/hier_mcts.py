@@ -600,7 +600,7 @@ def train_online_mcts(
                         test_stats[task]["lengths"].append(stats_info["episode_length"])
                         
                         if stats_info["win_rate"] is not None:
-                            test_stats[task]["win_rates"].append(stats_info["win"])
+                            test_stats[task]["win_rates"].append(stats_info["win_rate"])
             
             # 记录测试统计到控制台 - 只显示测试结果
             logger.console_logger.info("Test Results Summary:")

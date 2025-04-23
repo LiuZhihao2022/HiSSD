@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import multiprocessing as mp
 import time
 import torch
+from jax import profiler
 Tree = tree_lib.Tree
 T = TypeVar("T")
 
@@ -86,17 +87,41 @@ def simulate(
     # The action can be already visited, if the max_depth is reached.
     return end_state.node_index, end_state.action
 
+# def test_func(
+#     tree: Tree,
+#     # action_selection_fn: base.InteriorActionSelectionFn,
+#     max_depth: int) -> Tuple[chex.Array, chex.Array]:
 
+#     node_index = jnp.array(Tree.ROOT_INDEX, dtype=jnp.int32)
+#     depth = jnp.zeros((), dtype=tree.children_prior_logits.dtype)
+#     # pytype: disable=wrong-arg-types  # jnp-type
+#     initial_state = _SimulationState(
+#         node_index=tree.NO_PARENT,
+#         action=tree.NO_PARENT,
+#         next_node_index=node_index,
+#         depth=depth,
+#         is_continuing=jnp.array(True))
+
+#     # Returning a node with a selected action.
+#     # The action can be already visited, if the max_depth is reached.
+#     return initial_state.node_index, initial_state.action
+    # return node_index, node_index
 # 使用jax.vmap和jax.jit分别应用到simulate
-simulated_fn = functools.partial(jax.vmap, in_axes=[0, None, None], out_axes=0)(simulate)
-simulated_fn = jax.jit(simulated_fn, static_argnums=(1, 2))
+simulated_fn = jax.jit(simulate, static_argnums=(1,))
+simulated_fn = functools.partial(jax.vmap, in_axes=[0, None, None], out_axes=0)(simulated_fn)
+# simulated_fn = jax.jit(simulated_fn, static_argnums=(1,))
 
+# test_fn = jax.jit(test_func, static_argnums=(1,))
+# test_fn = functools.partial(jax.vmap, in_axes=[0, None, None], out_axes=0)(test_fn)
+# test_fn = jax.jit(test_func, static_argnums=(1, ))
+# test_fn = functools.partial(jax.vmap, in_axes=[0, None], out_axes=0)(test_fn)
 def search(
     params: base.Params,
     rng_key: np.random.RandomState,
     *,
     root: base.RootFnOutput,
     recurrent_fn: base.RecurrentFn,
+    action_selection_fn, 
     root_action_selection_fn: base.RootActionSelectionFn,
     interior_action_selection_fn: base.InteriorActionSelectionFn,
     num_simulations: int,
@@ -141,15 +166,16 @@ def search(
     `SearchResults` containing outcomes of the search, e.g. `visit_counts`
     `[B, num_actions]`.
   """
-  action_selection_fn = action_selection.switching_action_selection_wrapper(
-      root_action_selection_fn=root_action_selection_fn,
-      interior_action_selection_fn=interior_action_selection_fn
-  )
+  # action_selection_fn = action_selection.switching_action_selection_wrapper(
+  #     root_action_selection_fn=root_action_selection_fn,
+  #     interior_action_selection_fn=interior_action_selection_fn
+  # )
 
   batch_size = root.value.shape[0]
   batch_range = jnp.arange(batch_size)
   if max_depth is None:
-    max_depth = num_simulations
+    # max_depth = num_simulations
+    max_depth = jnp.array(num_simulations, dtype=jnp.int32)
   if invalid_actions is None:
     invalid_actions = jnp.zeros_like(root.prior_logits)
 
@@ -166,6 +192,8 @@ def search(
     # Simulate timing
     sim_start = time.time()
     parent_index, action = simulated_fn(tree, action_selection_fn ,max_depth)
+    # _1, _2 = test_fn(tree, action_selection_fn ,max_depth)
+    # _1, _2 = test_fn(tree ,2)
     timing_stats['simulate_time'] += time.time() - sim_start
     
     next_node_index = tree.children_index[batch_range, parent_index, action]
