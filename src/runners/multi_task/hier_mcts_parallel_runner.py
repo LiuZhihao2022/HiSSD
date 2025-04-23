@@ -24,8 +24,10 @@ from mctx._src.optimizer_wrapper import ValueOptimizerWrapper
 from mctx._src.simple_env import SimpleEnv
 from mctx._src.recurrent_fn import make_recurrent_fn_gym, make_recurrent_fn_world_model, make_multiagent_recurrent_fn_gym
 from mctx._src.utils import stochastic_top_k_sampling
+from mctx._src import action_selection
 from examples.policy_improvement_demo import initialize_root, DemoOutput
-
+import jax
+jax.config.update('jax_debug_nans', True)
 # 配置日志级别，减少调试信息
 logging.getLogger('jax').setLevel(logging.INFO)
 logging.getLogger('absl').setLevel(logging.WARNING)
@@ -83,6 +85,30 @@ class HierMCTSParallelRunner:
         self.accumulated_rewards = [0 for _ in range(self.batch_size)]
         self.terminated = [False for _ in range(self.batch_size)]
         self.wm_hidden_states = None
+        self.rng_key=jax.random.PRNGKey(self.args.env_args['seed']) 
+        root_action_selection_fn=functools.partial(
+          action_selection.gumbel_muzero_root_action_selection,
+          num_simulations=self.num_simulations,
+          max_num_considered_actions=self.max_num_considered_actions,
+          qtransform=functools.partial(
+                mctx.qtransform_completed_by_mix_value,
+                use_mixed_value=self.use_mixed_value,
+            ),
+        )
+        
+        interior_action_selection_fn=functools.partial(
+            action_selection.gumbel_muzero_interior_action_selection,
+            qtransform=functools.partial(
+                mctx.qtransform_completed_by_mix_value,
+                use_mixed_value=self.use_mixed_value,
+            ),
+        )
+
+
+        self.action_selection_fn = action_selection.switching_action_selection_wrapper(
+            root_action_selection_fn=root_action_selection_fn,
+            interior_action_selection_fn=interior_action_selection_fn
+        )
 
     def setup(self, scheme, groups, preprocess, mac, mcts_network):
         self.new_batch = partial(
@@ -409,12 +435,14 @@ class HierMCTSParallelRunner:
             wm_hidden_states=wm_hidden_states,
             bs_id=list(range(self.batch_size)),
         )
+        # rng_key, split_key = jax.random.split(self.rng_key)
         # 批量运行MCTS
-        policy_output, timing_stats, advantages, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states = mctx.gumbel_muzero_policy(
+        policy_output, timing_stats, advantages, new_wm_hidden_states, new_policy_hidden_states, new_critic_hidden_states, rng_key = mctx.gumbel_muzero_policy(
             params=(),
-            rng_key=np.random.RandomState(),
+            rng_key=self.rng_key,
             root=roots,
             recurrent_fn=self.recurrent_fn,
+            action_selection_fn=self.action_selection_fn,
             num_simulations=self.num_simulations,
             task=self.task,
             current_t_env=self.t_env,
@@ -427,6 +455,7 @@ class HierMCTSParallelRunner:
             ),
         )
         # 只挑选env_indices对应的结果
+        self.rng_key = rng_key
         skill_indices = []  # [len(env_indices)]
         mcts_datas = []
         new_wm_hidden_states = th.tensor(np.array(new_wm_hidden_states)).to(self.args.device)
