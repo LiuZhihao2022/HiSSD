@@ -539,9 +539,9 @@ def train_online_mcts(
             value_loss = loss_dict.get("value_loss", 0.0)
             
             logger.log_stat("mcts_network_loss", loss, current_t_env)
-            mcts_train_stats["loss"].append(loss)
-            mcts_train_stats["policy_loss"].append(policy_loss)
-            mcts_train_stats["value_loss"].append(value_loss)
+            # mcts_train_stats["loss"].append(loss)
+            # mcts_train_stats["policy_loss"].append(policy_loss)
+            # mcts_train_stats["value_loss"].append(value_loss)
             
             # 使用wandb记录训练信息
             if use_wandb:
@@ -561,18 +561,18 @@ def train_online_mcts(
                 logger.console_logger.info(f"Updated MCTS network target at t_env: {current_t_env}")
                 
             # 定期记录平均损失，记录平均损失后清空mcts_train_stats。这个是只有可以训练的时候才记录，还不能和下面的logger记录相合并
-            if (current_t_env - last_log_T) >= main_args.log_interval:
-                if use_wandb:
-                    # 记录平均损失
-                    wandb.log({
-                        "mcts/avg_loss": np.mean(mcts_train_stats["loss"]),
-                        "mcts/avg_policy_loss": np.mean(mcts_train_stats["policy_loss"]),
-                        "mcts/avg_value_loss": np.mean(mcts_train_stats["value_loss"]),
-                    }, step=current_t_env)
+            # if (current_t_env - last_log_T) >= main_args.log_interval:
+            #     if use_wandb:
+            #         # 记录平均损失
+            #         wandb.log({
+            #             "mcts/avg_loss": np.mean(mcts_train_stats["loss"]),
+            #             "mcts/avg_policy_loss": np.mean(mcts_train_stats["policy_loss"]),
+            #             "mcts/avg_value_loss": np.mean(mcts_train_stats["value_loss"]),
+            #         }, step=current_t_env)
                 
-                # 重置统计信息
-                for k in mcts_train_stats:
-                    mcts_train_stats[k] = []
+            #     # 重置统计信息
+            #     for k in mcts_train_stats:
+            #         mcts_train_stats[k] = []
         
         # 定期测试 - 使用online专用的测试间隔
         if (current_t_env - last_test_T) / test_interval_online >= 1 or current_t_env >= main_args.online_steps:
@@ -639,17 +639,7 @@ def train_online_mcts(
                     if test_stats[task]["win_rates"]:
                         test_win_rate = np.mean(test_stats[task]["win_rates"])
                         test_data[f"test/{task}/win_rates"] = test_win_rate
-                        # all_test_wins.extend(test_stats[task]["win_rates"])
-                    
-                    # all_test_returns.extend(test_stats[task]["returns"])
-                
-                # 记录所有任务的整体测试统计
-                # if all_test_returns:
-                #     test_data["test/overall_mean_return"] = np.mean(all_test_returns)
-                #     test_data["test/overall_std_return"] = np.std(all_test_returns)
-                
-                # if all_test_wins:
-                #     test_data["test/overall_win_rate"] = np.mean(all_test_wins)
+
                 
                 # 记录测试时间
                 test_data["test/test_time"] = time.time() - test_start_time

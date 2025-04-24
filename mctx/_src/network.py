@@ -583,10 +583,9 @@ def prepare_batch_data(sampled_batch: Tuple,
         max_visit = np.max(visit_count, axis=-1, keepdims=True)
         visit_scale = max_visit + max_visit_init
         transformed_adv = visit_scale * value_scale * advantage
+        state_np = to_np(tree.embeddings[:, root_idx])
+        obs_np = to_np(tree.observations[:, root_idx])
         if not use_real_data:
-
-            state_np = to_np(tree.embeddings[:, root_idx])
-            obs_np = to_np(tree.observations[:, root_idx])
             reward_np = np.array([tree.children_rewards[b, root_idx, a]
                                   for b, a in zip(batch_range, action)])
             next_state_np = np.array([tree.embeddings[br, tree.children_index[br, root_idx, a]] for br, a in zip(batch_range, action)])
@@ -595,8 +594,6 @@ def prepare_batch_data(sampled_batch: Tuple,
         else:
 
             # real data path
-            state_np = to_np(real_next_state)
-            obs_np = to_np(real_next_obs)
             reward_np = [to_np(real_r)]
             next_state_np = to_np(real_next_state)
             done_np = [to_np(real_done)]
