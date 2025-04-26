@@ -26,7 +26,8 @@ class HISSDLearner:
         self.task2n_agents = mac.task2n_agents
         self.surrogate_decomposer = mac.surrogate_decomposer
         self.task2decomposer = mac.task2decomposer
-        
+        self.task2input_shape_info = mac.task2input_shape_info  # 新增：获取输入shape信息
+        self.n_actions = {}
         # 使用mac中的mixer而不是在这里初始化
         self.mixer = mac.mixer
         self.target_mixer = mac.target_mixer
@@ -54,6 +55,7 @@ class HISSDLearner:
             self.task2train_info[task]["log_stats_t"] = (
                 -task_args.learner_log_interval - 1
             )
+            self.n_actions[task] = self.task2input_shape_info[task]["last_action_shape"]
 
         self.c = main_args.c_step
         self.skill_dim = main_args.skill_dim
@@ -73,6 +75,22 @@ class HISSDLearner:
         self.pretrain_steps = 0
         self.training_steps = 0
         self.reset_last_batch()
+
+        # 新增：InfoNCE投影MLP
+        proj_dim = 128
+        # 获取obs维度
+        input_dim = self.task2input_shape_info[list(self.task2input_shape_info.keys())[0]]["input_shape"]
+        self.infonce_proj_skill = th.nn.Sequential(
+            th.nn.Linear(self.entity_embed_dim + input_dim, proj_dim),
+            th.nn.ReLU(inplace=True),
+            th.nn.Linear(proj_dim, proj_dim)
+        )
+        # TODO: 因为只有一个task，所以这里直接用task是可以的。不过multi-task的实现中，这样是不可以的
+        self.infonce_proj_act = th.nn.Sequential(
+            th.nn.Linear(self.c * self.n_actions[task], proj_dim),
+            th.nn.ReLU(inplace=True),
+            th.nn.Linear(proj_dim, proj_dim)
+        )
 
     def _reset_optimizer(self):
         if self.main_args.optim_type.lower() == "rmsprop":
@@ -176,7 +194,7 @@ class HISSDLearner:
 
         return target_outs
     
-    def train_vae(# TODO:目前VAE的重建以及技能选择都不是离散的. 若要更改为VQ-VAE，可能需要加入向量量化损失,承诺损失 (commitment loss),codebook使用分布损失
+    def train_vae(
         self,
         batch: EpisodeBatch,
         t_env: int,
@@ -191,32 +209,28 @@ class HISSDLearner:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
         dec_loss = 0.0
+        infonce_loss = 0.0
         b, t, n = actions.shape[0], actions.shape[1], actions.shape[2]
         self.mac.init_hidden(batch.batch_size, task)
         t = 0
-        while t < batch.max_seq_length - self.c: # TODO:这里留出了接口，一次planner的技能选择可以指导c_time次底层动作选择. 是从skill重建动作，与原动作进行比对
-            act_outs = []   # forward_planner的作用是提取skill，计算技能表示，forward_planner_feedforward的作用是根据技能表示计算特定任务的特征(action or value)
-            # 和技能相关，不是基本动作，本来是想用skill的。但是和forward_planner相关的输入，由于数据集里没有skill，在world_model_predict中也没有basic action，所以不能用这两个。
+        while t < batch.max_seq_length - self.c:
+            act_outs = []
             agent_inputs = self.mac._build_inputs(batch, t=t, task=task)
-            agent_outs, _, _ = self.mac.forward_planner(
-                batch, t=t, task=task, actions=actions[:, t], hrl=True, skill_index_out=False
+            # 得到当前batch的skill embedding和skill index
+            agent_outs, _, skill_index = self.mac.forward_planner(
+                batch, t=t, task=task, actions=actions[:, t], hrl=True, skill_index_out=True
             )
-            act_agent_outs = self.mac.forward_planner_feedforward(agent_outs, additional_input=agent_inputs, forward_type="action", task=task)
-            
-            for i in range(self.c):# 提取当前环境状态的关键特征,作为判别器，区分不同状态和任务的特征
-                # single task setting下，已经不需要forward_discriminator了
-                # _, discr_h = self.mac.forward_discriminator(batch, t=t + i, task=task)
-                # act_out, _ = self.mac.forward_global_action(
-                #     batch, act_agent_outs, discr_h, t + i, task
-                # )
+            act_agent_outs = self.mac.forward_planner_feedforward(
+                agent_outs, additional_input=agent_inputs, forward_type="action", task=task
+            )
+            for i in range(self.c):
                 act_out = self.mac.forward_global_action(
-                    # batch, act_agent_outs, discr_h, t + i, task
                     batch, act_agent_outs, None, t + i, task
                 )
                 act_outs.append(act_out)
             act_outs = th.stack(act_outs, dim=1)
             _, _, n, a = act_out.shape
-            dec_loss += ( # 动作重建损失：衡量预测动作与真实动作之间的差异. 这是VAE框架中的重建损失部分，目标是使解码后的动作尽可能接近真实执行的动作
+            dec_loss += (
                 F.cross_entropy(
                     act_outs.reshape(-1, a),
                     actions[:, t : t + self.c].squeeze(-1).reshape(-1),
@@ -224,6 +238,64 @@ class HISSDLearner:
                 )
                 / mask[:, t : t + self.c].sum()
             ) / n
+
+            # ====== InfoNCE部分（skill embedding vs. 动作序列）======
+            skill_dim = self.skill_dim
+            bs = batch.batch_size
+            n_agents = self.task2n_agents[task]
+            device = agent_inputs.device
+            total = bs * n_agents
+            n_enemy = self.task2decomposer[task].n_enemies
+            n_ally = n_agents - 1
+
+            # 1. 构造所有skill embedding
+            all_skill_embeds = []
+            for k in range(skill_dim):
+                skill_idx = th.full((bs, n_agents), k, dtype=th.long, device=device)
+                skill_emb = self.mac.get_skill(skill_idx)  # [bs, n_agents, entity_embed_dim]
+                all_skill_embeds.append(skill_emb.reshape(total, -1))  # [total, entity_embed_dim]
+            all_skill_embeds = th.stack(all_skill_embeds, dim=0)  # [skill_dim, total, entity_embed_dim]
+
+            # 获取当前obs（agent_inputs），shape [total, obs_dim]
+            obs_dim = self.task2input_shape_info[task]["input_shape"]
+            obs_inputs = agent_inputs  # [total, obs_dim]
+
+            # 拼接obs到skill embedding
+            obs_inputs_expand = obs_inputs.unsqueeze(0).expand(skill_dim, -1, -1)  # [skill_dim, total, obs_dim]
+            skill_obs_cat = th.cat([all_skill_embeds, obs_inputs_expand], dim=-1)  # [skill_dim, total, entity_embed_dim+obs_dim]
+            # ---------------------------------------------------------------------------
+            all_skill_embeds = th.stack(all_skill_embeds, dim=0)  # [skill_dim, total, entity_embed_dim]
+
+            # 获取当前obs（agent_inputs），shape [total, obs_dim]
+            obs_dim = self.task2input_shape_info[task]["input_shape"]
+            obs_inputs = agent_inputs  # [total, obs_dim]
+
+            # 拼接obs到skill embedding
+            obs_inputs_expand = obs_inputs.unsqueeze(0).expand(skill_dim, -1, -1)  # [skill_dim, total, obs_dim]
+            skill_obs_cat = th.cat([all_skill_embeds, obs_inputs_expand], dim=-1)  # [skill_dim, total, entity_embed_dim+obs_dim]
+
+            # 3. 投影
+            proj_skill = self.infonce_proj_skill(skill_obs_cat)
+
+            # ---------------------------------------------------------------------------
+
+            # 3. 投影
+            proj_skill = self.infonce_proj_skill(skill_obs_cat)
+            # 投影动作序列: [total, c*a] -> [total, proj_dim]
+            proj_act = self.infonce_proj_act(gt_act_seq)
+
+            # 4. logits: [total, skill_dim]，labels: [total]（真实skill index）
+            logits = []
+            for i in range(total):
+                sims = []
+                for k in range(skill_dim):
+                    sim = F.cosine_similarity(proj_act[i], proj_skill[k, i], dim=0)
+                    sims.append(sim)
+                logits.append(th.stack(sims))
+            logits = th.stack(logits, dim=0)  # [total, skill_dim]
+            labels = skill_index.reshape(-1)  # [total]
+            infonce_loss += F.cross_entropy(logits, labels)
+            # ====== InfoNCE部分结束 ======
             t += self.c
 
         if (# TODO:不将ssl_type进行设置，就可以不加入contrastive loss进行任务区分；或者说，我的ssl_loss是为了学习多个skill-state在多个t后的状态表示而非任务区分，需要修改
@@ -319,22 +391,12 @@ class HISSDLearner:
             ssl_loss = th.tensor(0.0)
         # vae_loss实际上就是另一种形式的dec_loss. 所以只在planner中记录dec_loss就行了
         vae_loss = dec_loss / (batch.max_seq_length - self.c)
-        # 移除了奖励预测部分，现在在train_planner中进行
-        loss = vae_loss
+        infonce_loss = infonce_loss / (batch.max_seq_length - self.c)
+        loss = vae_loss + infonce_loss
         if ssl_loss is not None:
             loss += self.beta * ssl_loss
-        # TODO: 这些记录是不是可以放到最外面的run_sequential里去？
-        # 在函数末尾添加wandb记录
-        # if self.use_wandb:
-        #     wandb.log({
-        #         f"{task}/vae_loss": vae_loss.item(),
-        #         f"{task}/dec_loss": dec_loss.item(),
-        #         f"{task}/ssl_loss": ssl_loss.item() if ssl_loss is not None else 0.0
-        #     }, step=t_env)
-
         loss.backward()
-
-        return vae_loss, ssl_loss
+        return vae_loss, ssl_loss, infonce_loss
 
     def test_vae(self, batch: EpisodeBatch, t_env: int, episode_num: int, task: str):
         rewards = batch["reward"][:, :]
@@ -457,6 +519,7 @@ class HISSDLearner:
         dec_loss=None,
         cls_loss=None,
         ssl_loss=None,
+        infonce_loss=None,
     ):
         # Get the relevant quantities
         rewards = batch["reward"][:, :]
@@ -592,7 +655,9 @@ class HISSDLearner:
             self.logger.log_stat(f"{task}/value_loss", v_loss.item(), t_env)
             self.logger.log_stat(f"{task}/plan_loss", planner_loss.item(), t_env)
             # self.logger.log_stat(f"{task}/ssl_loss", ssl_loss.item(), t_env)
+            self.logger.log_stat(f"{task}/infonce_loss", infonce_loss.item(), t_env)
             self.logger.log_stat(f"{task}/reward_pred_loss", reward_pred_loss.item(), t_env)
+            
             self.task2train_info[task]["log_stats_t"] = t_env
 
         # 在函数末尾添加wandb记录
@@ -604,6 +669,7 @@ class HISSDLearner:
                 # planner_loss就是TD-error加权过后的obs_loss
                 f"{task}/plan_loss": planner_loss.item(),
                 # f"{task}/ssl_loss": ssl_loss.item() if ssl_loss is not None else 0.0,
+                f"{task}/infonce_loss": infonce_loss.item() if infonce_loss is not None else 0.0,
                 f"{task}/reward_pred_loss": reward_pred_loss.item(),
                 # f"{task}/td_error": td_error.item() if not self.adaptation else 0.0,
                 # f"{task}/weight": weight.mean().item() if not self.adaptation else 0.0
@@ -702,7 +768,7 @@ class HISSDLearner:
             # ssl_loss = 0
             # v_loss = 0
             # TODO: 这里记得修改回来
-            dec_loss, ssl_loss = self.train_vae(batch, t_env, episode_num, task)
+            dec_loss, ssl_loss, infonce_loss = self.train_vae(batch, t_env, episode_num, task)
             self.update_last_batch(task, batch)
             self.update(pretrain=False)
             v_loss = self.train_value(batch, t_env, episode_num, task)
@@ -716,6 +782,7 @@ class HISSDLearner:
                 v_loss=v_loss,
                 dec_loss=dec_loss,
                 ssl_loss=ssl_loss,
+                infonce_loss=infonce_loss,
             )
         self.training_steps += 1
 
@@ -726,6 +793,10 @@ class HISSDLearner:
         self.logger.console_logger.info("Updated target network")
 
     def cuda(self):
+        """将模型转移到GPU上"""
+        self.infonce_proj_act.cuda()
+        self.infonce_proj_skill.cuda()
+        # self.device = "cuda"
         self.mac.cuda()
         self.target_mac.cuda()
         if self.mixer is not None:

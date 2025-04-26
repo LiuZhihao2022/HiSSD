@@ -51,8 +51,8 @@ class HISSDSMAC:
 
         # build agents
         # get input dimensions for each task, can choose to append action shape and id shape or not
-        task2input_shape_info = self._get_input_shape()
-        self._build_agents(task2input_shape_info)
+        self.task2input_shape_info = self._get_input_shape()
+        self._build_agents(self.task2input_shape_info)
 
         self.skill_dim = main_args.skill_dim
         self.c_step = main_args.c_step
@@ -527,15 +527,16 @@ class HISSDSMAC:
 
         device = agent_inputs.device
         skill_index = np.array(skill_index)
-        skill_code = self.get_skill(skill_index)
-
+        outputs = self.get_skill(skill_index)
         task_args, n_agents = self.task2args[task], self.task2n_agents[task]
         task_decomposer = self.task2decomposer[task]
         n_enemy = task_decomposer.n_enemies
         n_ally = n_agents - 1
+        #decoded_skill = self.agent.planner.skill_module.skill_decoder(skill_code)
+        skill_code = self.agent.planner.task2unsqueeze_mlp[task](outputs).reshape(batch_size * n_agents, self.get_total_agents(task), self.main_args.entity_embed_dim)
         own_skill = skill_code[:, 0].unsqueeze(1)
         enemy_skill = skill_code[:, 1:1+n_enemy]
-        ally_skill = skill_code[:, 1+n_enemy:1+n_enemy+n_ally]
+        ally_skill = skill_code[:, 1+n_enemy:1+n_enemy+n_ally] # TODO: 这里的ally skill已经不对了，这里应该只有n_agent个智能体，不能按照这么来计算skill
         all_skill = [own_skill, enemy_skill, ally_skill]
 
         action_out_h = self.forward_planner_feedforward(

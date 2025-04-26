@@ -19,6 +19,7 @@ class SkillModule(nn.Module):
         self.code_dim = args.code_dim
         # TODO:为什么这个系数取这么小？是因为skill的重建本身就要求loss很小吗？不过这个也不会影响其他模块的训练就是了
         self.comit_coef = 1e-4
+        self.diver_coef = 1e-4
         self.vq_coef = 0.05
         self.skill_encoder = MLPNet(self.entity_embed_dim, self.code_dim, 128)
         self.skill_decoder = MLPNet(self.code_dim, self.entity_embed_dim, 128)
@@ -35,7 +36,8 @@ class SkillModule(nn.Module):
             emb, skill_index = self.emb(z_e, training=True)
             commit_loss = F.mse_loss(z_e, emb.detach())
             emb = self.skill_decoder(emb).reshape(*list(shape))
-            return emb, skill_index, self.comit_coef*commit_loss
+            diverse_loss = self.compute_emb_diverse_loss()
+            return emb, skill_index, self.comit_coef*commit_loss, self.diver_coef*diverse_loss
             # recon = self.skill_decoder(emb).mean
 
             # rec_loss = F.mse_loss(recon, seq['deter'])
@@ -55,6 +57,27 @@ class SkillModule(nn.Module):
 
             loss = rec_loss + self.vq_coef*vq_loss + self.comit_coef*commit_loss
             return loss, {'rec_loss': rec_loss, 'vq_loss' : vq_loss, 'commit_loss': commit_loss}
+        
+    def compute_emb_diverse_loss(self):
+        """
+        计算 skill_module 中 emb.weight 的多样性loss，使不同skill embedding相互远离
+        """
+        # 1. 获取embedding权重
+        emb_weight = self.emb.weight  # (skill_dim, code_dim)
+
+        # 2. 归一化后计算 pairwise 相似度
+        norm_emb = F.normalize(emb_weight, dim=1)  # 单位化
+        similarity_matrix = torch.matmul(norm_emb, norm_emb.T)  # (skill_dim, skill_dim)
+
+        # 3. 只取上三角（不含对角线）
+        skill_dim = similarity_matrix.size(0)
+        mask = torch.triu(torch.ones(skill_dim, skill_dim, device=similarity_matrix.device), diagonal=1)
+        pairwise_similarities = similarity_matrix[mask == 1]  # (skill_dim*(skill_dim-1)/2, )
+
+        # 4. 定义loss：相似度越小越好，所以直接平方求均值
+        diverse_loss = (pairwise_similarities ** 2).mean()
+
+        return diverse_loss
 
 
 class NearestEmbedFunc(torch.autograd.Function):

@@ -175,7 +175,7 @@ class HISSDAgent(nn.Module):
         if hasattr(self.planner, 'skill_module') and hasattr(self.planner.skill_module, 'emb'):
             shape = skill_index.shape
             # 获取 weight 的形状 (x, y)
-            weight = self.planner.skill_module.emb.weight
+            weight = self.planner.skill_module.emb.weight.detach()
             x, y = weight.shape
             # 使用 gather 来根据 skill_index 提取对应的向量
             expanded_vectors = weight[:, skill_index]  # 这会返回一个形状为 (d, m, n) 的 tensor
@@ -750,7 +750,7 @@ class Decoder(nn.Module):
         attack_action_inputs = outputs[:, 1: 1+n_enemy]
         q_attack = self.ally_q_skill(attack_action_inputs)
         q = th.cat([q_base, q_attack.reshape(-1, n_enemy)], dim=-1)
-
+        # TODO: 为什么不管每个batch，他的输入skill是什么，decoder得到的值都一样？
         # return q, h, cls_out
         return q, h
 
@@ -867,8 +867,8 @@ class PlannerModel(nn.Module):
 
     def feedforward(self, inputs, forward_type='action', additional_input=None,task=None):
         assert forward_type in ['action', 'value', 'reward']
-        own_emb, enemy_emb, ally_emb = inputs
-        n_enemy, n_ally = enemy_emb.shape[1], ally_emb.shape[1]
+        own_emb_skill, enemy_emb_skill, ally_emb_skill = inputs
+        n_enemy, n_ally = enemy_emb_skill.shape[1], ally_emb_skill.shape[1]
         if forward_type == "reward" or forward_type == "value":
             emb = self.state_encoder(additional_input,task)
         elif forward_type == "action":
@@ -877,18 +877,18 @@ class PlannerModel(nn.Module):
         own_emb, enemy_emb, ally_emb = emb
         if additional_input is None:
             raise ValueError("additional_input should not be None")
-        if forward_type == 'action':
-            own_out = self.act_own_forward(th.concat([own_emb, own_emb], dim=-1))
-            enemy_out = self.act_enemy_forward(th.concat([enemy_emb, enemy_emb], dim=-1))
-            ally_out = self.act_ally_forward(th.concat([ally_emb, ally_emb], dim=-1))
+        if forward_type == 'action':    # 这里concat两个完全相同的，skill完全没用上啊。。。
+            own_out = self.act_own_forward(th.concat([own_emb_skill, own_emb], dim=-1))
+            enemy_out = self.act_enemy_forward(th.concat([enemy_emb_skill, enemy_emb], dim=-1))
+            ally_out = self.act_ally_forward(th.concat([ally_emb_skill, ally_emb], dim=-1))
         elif forward_type == 'value':
-            own_out = self.value_own_forward(th.concat([own_emb, own_emb], dim=-1))
-            enemy_out = self.value_enemy_forward(th.concat([enemy_emb, enemy_emb], dim=-1))
-            ally_out = self.value_ally_forward(th.concat([ally_emb, ally_emb], dim=-1))
+            own_out = self.value_own_forward(th.concat([own_emb_skill, own_emb], dim=-1))
+            enemy_out = self.value_enemy_forward(th.concat([enemy_emb_skill, enemy_emb], dim=-1))
+            ally_out = self.value_ally_forward(th.concat([ally_emb_skill, ally_emb], dim=-1))
         elif forward_type == 'reward':
-            own_out = self.rew_own_forward(th.concat([own_emb, own_emb], dim=-1))
-            enemy_out = self.rew_enemy_forward(th.concat([enemy_emb, enemy_emb], dim=-1))
-            ally_out = self.rew_ally_forward(th.concat([ally_emb, ally_emb], dim=-1))
+            own_out = self.rew_own_forward(th.concat([own_emb_skill, own_emb], dim=-1))
+            enemy_out = self.rew_enemy_forward(th.concat([enemy_emb_skill, enemy_emb], dim=-1))
+            ally_out = self.rew_ally_forward(th.concat([ally_emb_skill, ally_emb], dim=-1))
 
         return [own_out, enemy_out, ally_out]
     # inputs就是obs+last_action+agent_id
@@ -962,8 +962,9 @@ class PlannerModel(nn.Module):
         # shape : [bs * n_agents, entity_embed_dim]
         outputs = squeeze_mlp(outputs.reshape(b, self.total_agents[task]*self.entity_embed_dim))
         commit_loss = th.tensor(0.).to(inputs.device)
+        diver_loss = th.tensor(0.).to(inputs.device)
         if self.vq_skill:
-            outputs, skill_index, commit_loss = self.skill_module(outputs)
+            outputs, skill_index, commit_loss, diver_loss = self.skill_module(outputs)
         else:
             skill_index = None  # 非VQ模式时返回None
         outputs = unsqueeze_mlp(outputs).reshape(outs_shape)
@@ -979,7 +980,7 @@ class PlannerModel(nn.Module):
         if next_inputs is not None and loss_out:
             out_loss = self.rec_module([own_out, enemy_out, ally_out], original_inputs, next_inputs, states, next_states, 
                                        task, t=t, actions=actions)
-            out_loss += commit_loss
+            out_loss += commit_loss + diver_loss
         
         return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, skill_index
 

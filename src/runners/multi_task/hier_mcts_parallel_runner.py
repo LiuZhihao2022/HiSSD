@@ -142,7 +142,10 @@ class HierMCTSParallelRunner:
             self.mcts_network,
             self.temperature,
             self.n_agents,
-            self.k
+            self.k,
+            offline_value_start=self.args.offline_value_start,
+            offline_value_end=self.args.offline_value_end,
+            offline_value_anneal_time=self.args.offline_value_anneal_time
         )
         
         # 为每个环境创建MCTS回放缓冲区
