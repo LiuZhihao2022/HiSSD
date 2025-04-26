@@ -227,6 +227,7 @@ class HISSDSMAC:
         return self.last_out_h, self.last_obs_loss, self.last_skill_index
     # additional_input可以根据forward_type选择不同的输入数据
     # 暂时都使用state作为additional_input
+    # 作用：得到技能表示后，将技能与特定目的相结合，处理为特定种类(action, reward, value)的表示，辅助最终计算
     def forward_planner_feedforward(self, emb_inputs, additional_input=None, forward_type="action",task=None):
         out_h = self.agent.forward_planner_feedforward(emb_inputs, forward_type=forward_type, additional_input=additional_input, task=task)
         return out_h
