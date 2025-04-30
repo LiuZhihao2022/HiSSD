@@ -1,0 +1,23 @@
+env: sc2v2
+
+env_args:
+  debug: False
+  conic_fov: False
+  obs_own_pos: True
+  use_unit_ranges: True
+  min_attack_range: 2
+
+test_nepisode: 32
+test_interval: 1000
+log_interval: 1000
+runner_log_interval: 1000
+learner_log_interval: 1000
+save_model_interval: 10000
+t_max: 251000
+
+# offline dataset
+offline_data_folder: "dataset"
+offline_data_name: ""
+offline_data_quality: "Replay"
+offline_data_size: 2000
+offline_data_shuffle: False

@@ -1,14 +1,14 @@
 dataset: 3s5z/medium-replay
 env: sc2
 pretrain_tasks:
-- 3m
+- 3s5z
 pretrain_tasks_data_quality:
-  3m: medium
-task: marine-easy-expert
+  3s5z: medium-replay
+task: marine-easy-medium-replay
 test_tasks:
-- 3m
+- 3s5z
 test_tasks_data_quality: {}
 train_tasks:
-- 3m
+- 3s5z
 train_tasks_data_quality:
-  3m: medium
+  3s5z: medium-replay

@@ -1,14 +1,14 @@
 dataset: 2s3z/expert
 env: sc2
 pretrain_tasks:
-- 3m
+- 2s3z
 pretrain_tasks_data_quality:
-  3m: medium
+  2s3z: expert
 task: marine-easy-expert
 test_tasks:
-- 3m
+- 2s3z
 test_tasks_data_quality: {}
 train_tasks:
-- 3m
+- 2s3z
 train_tasks_data_quality:
-  3m: medium
+  2s3z: expert

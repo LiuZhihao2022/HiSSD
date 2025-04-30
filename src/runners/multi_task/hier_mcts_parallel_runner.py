@@ -2,7 +2,7 @@ import numpy as np
 import torch as th
 import copy
 import sys
-sys.path.append('/home/lzh/HiSSD')
+sys.path.append('/home/liuzhihao/HiSSD')
 import logging
 import pickle
 import cloudpickle
@@ -15,7 +15,7 @@ from components.episode_buffer import EpisodeBatch
 from multiprocessing import Pipe, Process
 
 # FROM policy_improvement_demo.py
-sys.path.append('/home/lzh/HiSSD')
+sys.path.append('/home/liuzhihao/HiSSD')
 from typing import Tuple, Optional
 from absl import app
 from absl import flags
@@ -32,7 +32,6 @@ jax.config.update('jax_debug_nans', True)
 logging.getLogger('jax').setLevel(logging.INFO)
 logging.getLogger('absl').setLevel(logging.WARNING)
 
-
 class HierMCTSParallelRunner:
 
     def __init__(self, args, logger, task):
@@ -44,6 +43,7 @@ class HierMCTSParallelRunner:
         # 创建环境子进程
         self.parent_conns, self.worker_conns = zip(*[Pipe() for _ in range(self.batch_size)])
         env_fn = env_REGISTRY[self.args.env]
+
         worker_id2env_args = {}
         for worker_id in range(self.batch_size):
             worker_id2env_args[worker_id] = copy.deepcopy(self.args.env_args)
@@ -179,8 +179,6 @@ class HierMCTSParallelRunner:
             "avail_skills": [],
             "obs": []
         }
-        
-        # 获取初始状态和观测
         for parent_conn in self.parent_conns:
             data = parent_conn.recv()
             pre_transition_data["state"].append(data["state"])
@@ -501,26 +499,23 @@ def env_worker(remote, env_fn):
         cmd, data = remote.recv()
         if cmd == "step":
             actions = data
-            # 在环境中执行一步
             reward, terminated, env_info = env.step(actions)
-            # 返回观测、可用动作和状态以便选择下一个动作
             state = env.get_state()
             avail_actions = env.get_avail_actions()
             obs = env.get_obs()
             remote.send({
-                # 下一时间步选择动作所需的数据
                 "state": state,
                 "avail_actions": avail_actions,
                 "obs": obs,
-                # 当前时间步的其余数据
                 "reward": reward,
                 "terminated": terminated,
                 "info": env_info
             })
         elif cmd == "reset":
             env.reset()
+            state = env.get_state()
             remote.send({
-                "state": env.get_state(),
+                "state": state,
                 "avail_actions": env.get_avail_actions(),
                 "obs": env.get_obs()
             })
@@ -531,7 +526,7 @@ def env_worker(remote, env_fn):
         elif cmd == "get_env_info":
             remote.send(env.get_env_info())
         elif cmd == "get_stats":
-                    remote.send(env.get_stats())
+            remote.send(env.get_stats())
         else:
             raise NotImplementedError
 

@@ -1,14 +1,16 @@
 dataset: 3s5z/expert
-env: sc2
+env: sc2v2
 pretrain_tasks:
-- 3s5z
+- zerg_5_vs_5
 pretrain_tasks_data_quality:
-  3s5z: expert
+  zerg_5_vs_5: expert
 task: marine-easy-expert
 test_tasks:
-- 3s5z
+- zerg_5_vs_5
 test_tasks_data_quality: {}
 train_tasks:
-- 3s5z
+- zerg_5_vs_5
 train_tasks_data_quality:
-  3s5z: expert
+  zerg_5_vs_5: Replay
+
+scenario: 'zerg_5_vs_5'

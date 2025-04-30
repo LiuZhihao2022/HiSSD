@@ -1,0 +1,107 @@
+runner: "mt_parallel"
+mcts_runner: "hier_mcts_parallel"
+# only use for initializing action selector
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+# update the target network every _ steps
+target_update_interval: 200
+
+# use the Q_Learner to train
+agent_output_type: "q"
+learner: "hissd_learner"
+double_q: True
+mixer: "mt_qattn"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+
+name: "mcts"
+
+# agent type
+agent: "mt_hissd"
+
+# mac
+mac: "mt_hissd_mac"
+optim_type: "AdamW" # Optimizer type
+
+# params about trans mixing network
+entity_embed_dim: 64
+attn_embed_dim: 8
+# skill_dim: 64
+skill_dim: 16
+task: 3
+# beta: 0.001
+beta: 0.05
+coef_conservative: 5.0
+coef_dist: 5.0
+pretrain_steps: 20000
+pretrain: False
+weight_decay: 0.0001
+
+head: 1
+depth: 1
+
+# params about observation decomposition
+id_length: 4
+max_agent: 15
+
+# params about ensemble loss
+coef_ensemble: 0.001
+coef_kl: 0.1
+coef_ent: 0.01
+coef_sim: 1.0
+random: 0.5
+# mask: True
+mask: False
+td_weight: 10.0
+epsilon: 0.9
+
+# planner params
+num_stack_frames: 1
+vq_skill: True
+code_dim: 32
+reward_pred_weight: 1.0
+# discriminator params
+# ssl_type: "moco"
+# ssl_type: "byol"
+ssl_type: null # 没有使用ssl
+ssl_time_window: 4
+
+double_neg: True
+
+noise_weight: 0.
+adaptation: False
+debug: False
+
+# -----------------------hier-mcts params-----------------------
+batch_size: 8 # specially for episode runner
+batch_size_run: 8
+c_step: 5
+load_wm_path: "/home/liuzhihao/HiSSD/sc2_model_3m_5m/marine-easy-expert/10m_expert/251000"
+# load_wm_path: ""
+use_offline_training: False
+use_online_mcts: True # 暂时wm和mcts分开学, 只学stage 1
+online_steps: 2000500
+# 可以存放多少条数据，不过这个是要和buffer每次采样的size相关的
+replay_buffer_list_capacity: 200
+# target_update_interval: 200
+num_simulations: 32
+max_num_considered_actions: 16
+use_mixed_value: False
+obs_process_dim: 16
+k: 16
+temprature: 1.0
+value_loss_weight: 0.5
+max_grad_norm: 10.0
+state_embed_dim: 64
+offline_value_start: 1.0
+offline_value_end: 0.2
+offline_value_anneal_time: 500000
+save_model_interval_online: 50000
+test_nepisode_online: 20
+test_interval_online: 50000
+compute_infonce: True
+use_wandb: True

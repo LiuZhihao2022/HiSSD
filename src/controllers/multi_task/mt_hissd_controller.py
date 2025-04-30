@@ -13,6 +13,7 @@ from modules.mixers.qmix import QMixer
 from modules.mixers.multi_task.qattn import QMixer as MTAttnQMixer
 
 from utils.embed import binary_embed
+
 # This multi-agent controller shares parameters between agents
 class HISSDSMAC:
     def __init__(self, train_tasks, task2scheme, task2args, main_args):
@@ -32,6 +33,7 @@ class HISSDSMAC:
         # get decomposer for each task
         env2decomposer = {
             "sc2": "sc2_decomposer",
+            "sc2v2": "sc2_decomposer_v2",
         }
         self.task2decomposer, self.task2dynamic_decoder = {}, {}
         self.surrogate_decomposer = None
@@ -43,6 +45,15 @@ class HISSDSMAC:
                 )
                 self.task2decomposer[task] = task_decomposer
                 if not self.surrogate_decomposer:
+                    self.surrogate_decomposer = task_decomposer
+            elif task_args.env == "sc2v2":
+                # 创建并初始化 env
+                from smacv2.env.starcraft2.wrapper import StarCraftCapabilityEnvWrapper
+                env = StarCraftCapabilityEnvWrapper(**task_args.env_args)
+                # 然后通过 env2decomposer 去拿对应的 decomposer
+                task_decomposer = decomposer_REGISTRY[env2decomposer[task_args.env]](env)
+                self.task2decomposer[task] = task_decomposer
+                if self.surrogate_decomposer is None:
                     self.surrogate_decomposer = task_decomposer
             else:
                 raise NotImplementedError(f"Unsupported env decomposer {task_args.env}")

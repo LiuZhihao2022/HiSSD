@@ -210,8 +210,8 @@ class HISSDLearner:
         mask = batch["filled"][:, :].float()
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
-        dec_loss = 0.0
-        infonce_loss = 0.0
+        dec_loss = th.tensor(0.0, device = self.device)
+        infonce_loss = th.tensor(0.0, device = self.device)
         b, t, n = actions.shape[0], actions.shape[1], actions.shape[2]
         self.mac.init_hidden(batch.batch_size, task)
         t = 0
@@ -242,63 +242,64 @@ class HISSDLearner:
             ) / n
 
             # ====== InfoNCE部分（skill embedding vs. 动作序列）======
-            skill_dim = self.skill_dim
-            bs = batch.batch_size
-            n_agents = self.task2n_agents[task]
-            device = agent_inputs.device
-            total = bs * n_agents
-            n_enemy = self.task2decomposer[task].n_enemies
-            n_ally = n_agents - 1
+            if self.main_args.compute_infonce:
+                skill_dim = self.skill_dim
+                bs = batch.batch_size
+                n_agents = self.task2n_agents[task]
+                device = agent_inputs.device
+                total = bs * n_agents
+                n_enemy = self.task2decomposer[task].n_enemies
+                n_ally = n_agents - 1
 
-            # 1. 构造所有skill-state embedding
-            all_skill_embeds = []
-            for k in range(skill_dim):
-                skill_idx = th.full((bs, n_agents), k, dtype=th.long, device=device)
-                skill_emb = self.mac.get_skill(skill_idx)  # [bs, n_agents, entity_embed_dim]
-                all_skill_embeds.append(skill_emb.reshape(total, -1))  # [total, entity_embed_dim]
-            all_skill_embeds = th.stack(all_skill_embeds, dim=0)  # [skill_dim, total, entity_embed_dim]
-
-            # 获取当前obs（agent_inputs），shape [total, obs_dim]
-            obs_dim = self.task2input_shape_info[task]["input_shape"]
-            obs_inputs = agent_inputs  # [total, obs_dim]
-
-            # 拼接obs到skill embedding
-            obs_inputs_expand = obs_inputs.unsqueeze(0).expand(skill_dim, -1, -1)  # [skill_dim, total, obs_dim]
-            obs_inputs_expand = obs_inputs_expand.reshape(skill_dim * total, -1)  # [skill_dim*total, obs_dim]
-            # skill_obs_cat = th.cat([all_skill_embeds, obs_inputs_expand], dim=-1)  # [skill_dim, total, entity_embed_dim+obs_dim]
-
-            skill_code = self.mac.agent.planner.task2unsqueeze_mlp[task](all_skill_embeds).reshape(skill_dim*total, self.mac.get_total_agents(task), self.main_args.entity_embed_dim)
-            own_skill = skill_code[:, 0].unsqueeze(1)
-            enemy_skill = skill_code[:, 1:1+n_enemy]
-            ally_skill = skill_code[:, 1+n_enemy:1+n_enemy+n_ally] # TODO: 这里的ally skill已经不对了，这里应该只有n_agent个智能体，不能按照这么来计算skill
-            all_skill = [own_skill, enemy_skill, ally_skill]
-            # shape of action_out_h : own: (total * skill_dim, 1, entity_embed_dim), enemy: (total * skill_dim, n_enemy, entity_embed_dim)
-            action_out_h = self.mac.forward_planner_feedforward(
-                all_skill,
-                additional_input=obs_inputs_expand,
-                forward_type="action",
-                task=task
-                )
-
-            # 2. 得到真实动作序列的表征
-            gt_act_seq = act_outs.squeeze(2) if act_outs.dim() == 5 else act_outs  # [bs, c, n_agents, a]
-            gt_act_seq = gt_act_seq.permute(0, 2, 1, 3).reshape(total, self.c * a)  # [total, c*a]
-            # 3. 投影
-            proj_skill = self.infonce_proj_skill(th.cat(action_out_h, 1).reshape(total*skill_dim, -1)).reshape(skill_dim, total, -1)  # [skill_dim, total, proj_dim]
-            # 投影动作序列: [total, c*a] -> [total, proj_dim]
-            proj_act = self.infonce_proj_act(gt_act_seq)
-
-            # 4. logits: [total, skill_dim]，labels: [total]（真实skill index）
-            logits = []
-            for i in range(total):
-                sims = []
+                # 1. 构造所有skill-state embedding
+                all_skill_embeds = []
                 for k in range(skill_dim):
-                    sim = F.cosine_similarity(proj_act[i], proj_skill[k, i], dim=0)
-                    sims.append(sim)
-                logits.append(th.stack(sims))
-            logits = th.stack(logits, dim=0)  # [total, skill_dim]
-            labels = skill_index.reshape(-1)  # [total]
-            infonce_loss += F.cross_entropy(logits, labels)
+                    skill_idx = th.full((bs, n_agents), k, dtype=th.long, device=device)
+                    skill_emb = self.mac.get_skill(skill_idx)  # [bs, n_agents, entity_embed_dim]
+                    all_skill_embeds.append(skill_emb.reshape(total, -1))  # [total, entity_embed_dim]
+                all_skill_embeds = th.stack(all_skill_embeds, dim=0)  # [skill_dim, total, entity_embed_dim]
+
+                # 获取当前obs（agent_inputs），shape [total, obs_dim]
+                obs_dim = self.task2input_shape_info[task]["input_shape"]
+                obs_inputs = agent_inputs  # [total, obs_dim]
+
+                # 拼接obs到skill embedding
+                obs_inputs_expand = obs_inputs.unsqueeze(0).expand(skill_dim, -1, -1)  # [skill_dim, total, obs_dim]
+                obs_inputs_expand = obs_inputs_expand.reshape(skill_dim * total, -1)  # [skill_dim*total, obs_dim]
+                # skill_obs_cat = th.cat([all_skill_embeds, obs_inputs_expand], dim=-1)  # [skill_dim, total, entity_embed_dim+obs_dim]
+
+                skill_code = self.mac.agent.planner.task2unsqueeze_mlp[task](all_skill_embeds).reshape(skill_dim*total, self.mac.get_total_agents(task), self.main_args.entity_embed_dim)
+                own_skill = skill_code[:, 0].unsqueeze(1)
+                enemy_skill = skill_code[:, 1:1+n_enemy]
+                ally_skill = skill_code[:, 1+n_enemy:1+n_enemy+n_ally] # TODO: 这里的ally skill已经不对了，这里应该只有n_agent个智能体，不能按照这么来计算skill
+                all_skill = [own_skill, enemy_skill, ally_skill]
+                # shape of action_out_h : own: (total * skill_dim, 1, entity_embed_dim), enemy: (total * skill_dim, n_enemy, entity_embed_dim)
+                action_out_h = self.mac.forward_planner_feedforward(
+                    all_skill,
+                    additional_input=obs_inputs_expand,
+                    forward_type="action",
+                    task=task
+                    )
+
+                # 2. 得到真实动作序列的表征
+                gt_act_seq = act_outs.squeeze(2) if act_outs.dim() == 5 else act_outs  # [bs, c, n_agents, a]
+                gt_act_seq = gt_act_seq.permute(0, 2, 1, 3).reshape(total, self.c * a)  # [total, c*a]
+                # 3. 投影
+                proj_skill = self.infonce_proj_skill(th.cat(action_out_h, 1).reshape(total*skill_dim, -1)).reshape(skill_dim, total, -1)  # [skill_dim, total, proj_dim]
+                # 投影动作序列: [total, c*a] -> [total, proj_dim]
+                proj_act = self.infonce_proj_act(gt_act_seq)
+
+                # 4. logits: [total, skill_dim]，labels: [total]（真实skill index）
+                logits = []
+                for i in range(total):
+                    sims = []
+                    for k in range(skill_dim):
+                        sim = F.cosine_similarity(proj_act[i], proj_skill[k, i], dim=0)
+                        sims.append(sim)
+                    logits.append(th.stack(sims))
+                logits = th.stack(logits, dim=0)  # [total, skill_dim]
+                labels = skill_index.reshape(-1)  # [total]
+                infonce_loss += F.cross_entropy(logits, labels)
             # ====== InfoNCE部分结束 ======
             t += self.c
 

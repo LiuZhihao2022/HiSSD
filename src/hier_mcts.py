@@ -94,14 +94,80 @@ def evaluate_sequential(main_args, logger, task2runner):
 
 
 def init_tasks(task_list, main_args, logger):
+    # 只在此处定义
+    MAP_NAMES = {
+        "terran_5_vs_5": "10gen_terran",
+        "zerg_5_vs_5": "10gen_zerg",
+        "terran_10_vs_10": "10gen_terran",
+    }
+    DISTRIBUTION_CONFIGS = {
+        "terran_5_vs_5": {
+            "n_units": 5,
+            "n_enemies": 5,
+            "team_gen": {
+                "dist_type": "weighted_teams",
+                "unit_types": ["marine", "marauder", "medivac"],
+                "exception_unit_types": ["baneling"],
+                "weights": [0.45, 0.45, 0.1],
+                "observe": True,
+            },
+            "start_positions": {
+                "dist_type": "surrounded_and_reflect",
+                "p": 0.5,
+                "n_enemies": 5,
+                "map_x": 32,
+                "map_y": 32,
+            },
+        },
+        "zerg_5_vs_5": {
+            "n_units": 5,
+            "n_enemies": 5,
+            "team_gen": {
+                "dist_type": "weighted_teams",
+                "unit_types": ["zergling", "baneling", "hydralisk"],
+                "exception_unit_types": ["baneling"],
+                "weights": [0.45, 0.1, 0.45],
+                "observe": True,
+            },
+            "start_positions": {
+                "dist_type": "surrounded_and_reflect",
+                "p": 0.5,
+                "n_enemies": 5,
+                "map_x": 32,
+                "map_y": 32,
+            },
+        },
+        "terran_10_vs_10": {
+            "n_units": 10,
+            "n_enemies": 10,
+            "team_gen": {
+                "dist_type": "weighted_teams",
+                "unit_types": ["marine", "marauder", "medivac"],
+                "exception_unit_types": ["baneling"],
+                "weights": [0.45, 0.45, 0.1],
+                "observe": True,
+            },
+            "start_positions": {
+                "dist_type": "surrounded_and_reflect",
+                "p": 0.5,
+                "n_enemies": 5,
+                "map_x": 32,
+                "map_y": 32,
+            },
+        },
+    }
+
     task2args, task2runner, task2buffer = {}, {}, {}
     task2scheme, task2groups, task2preprocess = {}, {}, {}
 
     for task in task_list:
-        # define task_args
         task_args = copy.deepcopy(main_args)
+        # 统一设置map_name和capability_config
         if task_args.env == "sc2":
             task_args.env_args["map_name"] = task
+        elif task_args.env == "sc2v2":
+            task_args.env_args["map_name"] = MAP_NAMES[task_args.scenario]
+            task_args.env_args["capability_config"] = DISTRIBUTION_CONFIGS[task_args.scenario]
         elif task_args.env == "gymma":
             task_args.env_args["N"] = task
         task2args[task] = task_args
@@ -111,36 +177,30 @@ def init_tasks(task_list, main_args, logger):
         )
         task2runner[task] = task_runner
 
-        # Set up schemes and groups here
         env_info = task_runner.get_env_info()
         for k, v in env_info.items():
             setattr(task_args, k, v)
 
-        # Default/Base scheme
+        # scheme适配SMACv2
         scheme = {
             "state": {"vshape": env_info["state_shape"]},
             "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
             "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
             "skills": {"vshape": (1,), "group": "agents", "dtype": th.long},
             "avail_actions": {
-                # TODO: 这里如果就是n_actions，会在什么地方出问题吗？
                 "vshape": (env_info["n_actions"],),
-                # "vshape": (task_args.skill_dim,),
                 "group": "agents",
                 "dtype": th.int,
             },
             "avail_skills": {
-                # TODO: 这里如果就是n_actions，会在什么地方出问题吗？
-                # "vshape": (env_info["n_actions"],),
                 "vshape": (task_args.skill_dim,),
                 "group": "agents",
                 "dtype": th.int,
             },
-            # "reward": {"vshape": (1,)},
             "terminated": {"vshape": (1,), "dtype": th.uint8},
         }
-        # For individual rewards in gymmai reward is of shape (1, n_agents)
-        if main_args.env == "sc2":
+        # SMACv2奖励结构适配
+        if main_args.env in ["sc2", "sc2v2"]:
             scheme["reward"] = {"vshape": (1,)}
         elif main_args.common_reward:
             scheme["reward"] = {"vshape": (1,)}
@@ -150,7 +210,6 @@ def init_tasks(task_list, main_args, logger):
         preprocess = {
             "actions": ("actions_onehot", [OneHot(out_dim=task_args.n_actions)]),
             "skills": ("skills_onehot", [OneHot(out_dim=task_args.skill_dim)])
-            # "actions": ("actions_onehot", [OneHot(out_dim=task_args.skill_dim)]),
         }
 
         task2buffer[task] = ReplayBuffer(
@@ -162,7 +221,6 @@ def init_tasks(task_list, main_args, logger):
             device="cpu" if task_args.buffer_cpu_only else task_args.device,
         )
 
-        # store task information
         task2scheme[task], task2groups[task], task2preprocess[task] = (
             scheme,
             groups,
@@ -846,6 +904,7 @@ def run_sequential(args, logger):
             task,
             main_args.train_tasks_data_quality[task],
             data_folder=main_args.offline_data_name,
+            dataset_folder=args.offline_data_folder,
             offline_data_size=args.offline_data_size,
             random_sample=args.offline_data_shuffle,
         )
