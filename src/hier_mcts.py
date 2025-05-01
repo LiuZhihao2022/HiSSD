@@ -414,7 +414,7 @@ def train_online_mcts(
     
     # 初始化MCTS网络和经验回放缓冲区
     mcts_network = None
-    replay_buffer_list = ReplayBufferList(capacity=main_args.replay_buffer_list_capacity//main_args.batch_size if hasattr(main_args, "replay_buffer_list_capacity") else 100, use_real_data=True)
+    replay_buffer_list = ReplayBufferList(capacity=main_args.replay_buffer_list_capacity if hasattr(main_args, "replay_buffer_list_capacity") else 100, use_real_data=True)
     target_update_interval = main_args.target_update_interval if hasattr(main_args, "target_update_interval") else 20
     
     # 获取一些常用参数
