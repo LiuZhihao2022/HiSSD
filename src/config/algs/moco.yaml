@@ -7,7 +7,7 @@ epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
 # update the target network every _ steps
-target_update_interval: 80
+target_update_interval: 200
 
 # use the Q_Learner to train
 agent_output_type: "q"

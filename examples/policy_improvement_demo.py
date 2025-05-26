@@ -16,7 +16,7 @@
 import sys
 import os
 import time
-# sys.path.append('/Users/liuzhihao/Downloads/code/mctx-main')
+# sys.path.append('/Users/lzh/Downloads/code/mctx-main')
 sys.path.append('/home/lzh/HiSSD')
 # print(sys.path)
 import functools
@@ -71,7 +71,7 @@ class DemoOutput:
   selected_action_value: chex.Array
   action_weights_policy_value: chex.Array
 
-def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=FLAGS.num_agents, num_actions=FLAGS.num_actions, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None, bs_id = None) -> mctx.RootFnOutput:
+def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=FLAGS.num_agents, num_actions=FLAGS.num_actions, policy_hidden_states = None, critic_hidden_states = None, wm_hidden_states = None, bs_id = None, outer_value = None, avail_skills=None, reference_skill_indices=None) -> mctx.RootFnOutput:
     """
     Initializes the root node for the MCTS (Monte Carlo Tree Search) process.
 
@@ -83,6 +83,11 @@ def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=F
         k (int): The number of top actions to sample.
         policy_hidden_states: The hidden states of the policy network. Defaults to None.
         critic_hidden_states: The hidden states of the critic network. Defaults to None.
+        wm_hidden_states: The hidden states of the world model. Defaults to None.
+        bs_id: The batch IDs. Defaults to None.
+        outer_value: External value predictions. Defaults to None.
+        avail_skills: Available skills mask. Defaults to None.
+        reference_skill_indices: Reference skill indices to include in sampling. Defaults to None.
 
     Returns:
         mctx.RootFnOutput: The initialized root node containing prior logits, value, embedding, observation,
@@ -99,25 +104,70 @@ def initialize_root(network: PolicyRNN, state, observation, k: int, num_agents=F
         # policy_hidden_states, critic_hidden_states = network.init_hidden(batch_size= batch_size)
         policy_hidden_states, critic_hidden_states = network.get_hidden_states(bs_id)
 
-    # 使用stochastic_top_k_sampling选取动作
-    batched_sampled_queues_with_reference, new_policy_hidden_states = stochastic_top_k_sampling(
-        num_agents, network, observation, policy_hidden_states, num_actions, k+1
+    # 使用stochastic_top_k_sampling选取动作（保持原有计算方式）
+    batched_sampled_queues, new_policy_hidden_states = stochastic_top_k_sampling(
+        num_agents, network, observation, policy_hidden_states, num_actions, k+1, avail_skills
     )
-    batched_sampled_queues = [batch[:-1] for batch in batched_sampled_queues_with_reference]
-    experienced_thresholds = [batch[-1][2] for batch in batched_sampled_queues_with_reference]
+    logits, _ = network.predict_policy(observation, policy_hidden_states)
+    # 如果提供了参考技能索引，将其添加到采样队列中
+    if reference_skill_indices is not None:
+        for b_idx, batch_queue in enumerate(batched_sampled_queues):
+            # 获取当前batch对应的参考技能索引
+            ref_skill = reference_skill_indices[b_idx]
+            
+            # 获取参考技能的logits和计算perturbed_value
+            with torch.no_grad():
+                # 获取batch_b的观察和隐藏状态
+                # TODO: 这里也可以优化，在上面一起全部计算
+                # batch_obs = torch.tensor(observation[b_idx:b_idx+1], device=network.device)
+                # batch_hidden = policy_hidden_states[b_idx:b_idx+1]
+                
+                # 获取策略logits
+                # logits, _ = network.predict_policy(batch_obs, batch_hidden)
+                ref_logit = logits[b_idx].gather(-1, ref_skill).sum().detach().cpu().numpy().item()
+                
+                # 生成gumbel随机变量并计算perturbed_value
+                # 这模仿了stochastic_top_k_sampling中的做法
+                gumbel = np.random.gumbel(size=1)[0].item()
+                ref_perturbed_value = ref_logit + gumbel
+            
+            # 创建参考技能三元组
+            ref_tuple = (ref_skill, ref_logit, ref_perturbed_value)
+            
+            # 替换队列中的最后一个元素，确保参考技能被包含在采样中
+            batch_queue.append(ref_tuple)
+            batch_queue = sorted(batch_queue, key=lambda x: x[2], reverse=True)
+            # 只保留前k个元素
+            batch_queue = batch_queue[:k+1]
+            # 更新batched_sampled_queues
+            batched_sampled_queues[b_idx] = batch_queue
+
+    # 提取experienced_thresholds
+    experienced_thresholds = [batch[-1][2] for batch in batched_sampled_queues]
+    batched_sampled_queues = [batch[:-1] for batch in batched_sampled_queues]
 
     new_policy_hidden_states = new_policy_hidden_states.detach().cpu().numpy()
     # 提取partial actions和prior logits
     sampled_actions = [[action for action, _, _ in batch] for batch in batched_sampled_queues]
     prior_logits = [[log_prob for _, log_prob, _ in batch] for batch in batched_sampled_queues]
-    sampled_actions = np.array(sampled_actions)
+    try:
+        sampled_actions = np.array(sampled_actions)
+    except Exception as e:
+        stochastic_top_k_sampling(
+        num_agents, network, observation, policy_hidden_states, num_actions, k+1, avail_skills
+    )
     prior_logits = np.array(prior_logits)
     # 使用model计算选取动作的value
     value, new_critic_hidden_states = network.predict_value(state, critic_hidden_states)
     value = value.detach().cpu().numpy().flatten()
+    # TODO: just for test------------------------------------------------------
+    if outer_value is not None:
+        value = outer_value.detach().cpu().numpy().flatten()
+    # -------------------------------------------------------------------------
     new_critic_hidden_states = new_critic_hidden_states.detach().cpu().numpy()
     # --- 转换为 jnp ---
     prior_logits = jnp.array(prior_logits)
+    # TODO: 保证这个预测的value，和在wm中第一次预测的value值是一样的，就可以直接使用里面的wm_hidden_states当作hidden state
     value = jnp.array(value)
     state = jnp.array(state)
     observation = jnp.array(observation)

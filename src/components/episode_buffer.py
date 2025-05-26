@@ -106,7 +106,7 @@ class EpisodeBatch:
                 v = v.clone().detach().to(self.device)
             else:
                 v = th.tensor(v, dtype=dtype, device=self.device)
-            self._check_safe_view(v, target[k][_slices])
+            # self._check_safe_view(v, target[k][_slices])
             target[k][_slices] = v.view_as(target[k][_slices])
 
             if k in self.preprocess:
@@ -236,14 +236,30 @@ class ReplayBuffer(EpisodeBatch):
     def can_sample(self, batch_size):
         return self.episodes_in_buffer >= batch_size
 
-    def sample(self, batch_size):
-        assert self.can_sample(batch_size)
-        if self.episodes_in_buffer == batch_size:
-            return self[:batch_size]
+    def sample(self, batch_size, indices=None):
+        """
+        从缓冲区中采样一批数据
+        
+        参数:
+            batch_size: 需要采样的批次大小
+            indices: 可选，指定要采样的索引数组，如果提供则直接使用这些索引
+        
+        返回:
+            采样的EpisodeBatch
+        """
+        if indices is not None:
+            # 使用提供的索引直接采样
+            assert len(indices) <= self.episodes_in_buffer, "索引数量超过了缓冲区中的有效数据量"
+            return self[indices]
         else:
-            # Uniform sampling only atm
-            ep_ids = np.random.choice(self.episodes_in_buffer, batch_size, replace=False)
-            return self[ep_ids]
+            # 使用原有的随机采样逻辑
+            assert self.can_sample(batch_size)
+            if self.episodes_in_buffer == batch_size:
+                return self[:batch_size]
+            else:
+                # Uniform sampling only atm
+                ep_ids = np.random.choice(self.episodes_in_buffer, batch_size, replace=False)
+                return self[ep_ids]
 
     def clear(self):
         self.buffer_index = 0

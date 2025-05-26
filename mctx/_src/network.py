@@ -266,7 +266,7 @@ class PolicyRNN(nn.Module):
             Updates the target network for the critic.
     """
     """Recurrent neural network for computing conditional action probabilities."""
-    def __init__(self, obs_input_shape, emb_input_shape, output_shape, num_agents, device='cuda', optimizer='adam', hidden_dim=128, seed=42):
+    def __init__(self, obs_input_shape, emb_input_shape, output_shape, num_agents, c_step, device='cuda', optimizer='adam', hidden_dim=128, seed=42):
         super(PolicyRNN, self).__init__()
         self.hidden_dim = hidden_dim
         self.n_actions = output_shape
@@ -276,13 +276,14 @@ class PolicyRNN(nn.Module):
         self.policy_network = PolicyNetwork(obs_input_shape, output_shape, hidden_dim, seed)
         self.critic_network = CriticNetwork(emb_input_shape, hidden_dim, seed)
         self.device = "cuda" if torch.cuda.is_available() and device=='cuda' else "cpu"
+        self.c_step = c_step
         if self.device == 'cuda':
             self.policy_network.cuda()
             self.critic_network.cuda()
         if optimizer == 'adam':
-            self.optimizer = torch.optim.Adam(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), lr=1e-3)
+            self.optimizer = torch.optim.AdamW(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), lr=1e-4, weight_decay=1e-2)
         elif optimizer == 'rmsprop':
-            self.optimizer = torch.optim.RMSprop(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), lr=1e-3)
+            self.optimizer = torch.optim.RMSprop(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), lr=1e-4)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
     def get_hidden_states(self, bs_id=None):
@@ -363,7 +364,7 @@ class PolicyRNN(nn.Module):
             value, new_critic_hidden_state = self.critic_network(state, critic_hidden_state, use_target)
         return value, new_critic_hidden_state
 
-    def train_network(self, batch, gamma=0.99, value_loss_weight=0.5, max_grad_norm=10.0, use_real_data = False):
+    def train_network(self, batch, gamma=0.99, value_loss_weight=1., max_grad_norm=10.0, use_real_data = False, entropy_weight=0.5):
         """
         Trains the network using the provided batch of data.
         Args:
@@ -373,9 +374,11 @@ class PolicyRNN(nn.Module):
             gamma (float, optional): Discount factor for future rewards. Default is 0.99.
             value_loss_weight (float, optional): Weight for the value loss in the total loss calculation. Default is 0.5.
             max_grad_norm (float, optional): Maximum norm for gradient clipping. Default is 10.0.
+            use_real_data (bool, optional): Whether to use real data in training. Default is False.
+            entropy_weight (float, optional): Weight for entropy regularization. Default is 0.01.
         Returns:
             float: The total loss value after the training step.
-        """
+        """        
         states, observations, actions, rewards, next_states, dones, experienced_thresholds, improved_policy_probs, policy_hidden_states, critic_hidden_states, transformed_advantages, sampled_actions = prepare_batch_data(batch, use_real_data=use_real_data)
         observations = torch.FloatTensor(observations).to(self.device)
         states = torch.FloatTensor(states).to(self.device)
@@ -390,11 +393,16 @@ class PolicyRNN(nn.Module):
         experienced_thresholds = torch.FloatTensor(experienced_thresholds).to(self.device)
         # [B, k, num_agents]
         sampled_actions = torch.LongTensor(sampled_actions).to(self.device)
+        
         # shape of policy_logits is [B, num_agents, n_actions]
         policy_logits, predicted_values, _, new_critic_hidden_states = self.forward(states, observations, policy_hidden_states, critic_hidden_states)
         
         # Compute the probabilities for each action for each agent
         policy_probs = F.softmax(policy_logits, dim=-1)  # [B, num_agents, n_actions]
+        
+        # 计算策略熵: -sum(p * log(p))
+        # 对每个智能体的策略分布计算熵，并对所有智能体求平均
+        entropy = -torch.sum(policy_probs * torch.log(policy_probs + 1e-10), dim=-1).mean()
         
         ''' Explanation of gathered_probs computation:
             - policy_probs: [B, num_agents, n_actions]
@@ -408,35 +416,39 @@ class PolicyRNN(nn.Module):
             This allows us to evaluate the policy's performance on the sampled actions by multiplying the probabilities of the sampled actions
             to get the combined probabilities for each sample.
         '''
-        # 对于hier ma gumbel muzero来说，sampled_actions中的每一个，其实都是一个skill。skill的解码交给另外的解码器进行.做到最后，是可以通过policy直接获得skill而不需要mcts的
         gathered_probs = torch.gather(policy_probs.unsqueeze(1).expand(-1, sampled_actions.size(1), -1, -1), 3, sampled_actions.unsqueeze(-1)).squeeze(-1)
         gathered_logits = torch.gather(policy_logits.unsqueeze(1).expand(-1, sampled_actions.size(1), -1, -1), 3, sampled_actions.unsqueeze(-1)).squeeze(-1)
         # Compute the combined probabilities for each sampled action combination
         combo_probs = gathered_probs.prod(dim=2)  # [B, num_agents]
         combo_logits = gathered_logits.sum(dim=2)  # [B, num_agents]
         # Compute the policy loss. 这里是可以不使用去常数的logits的，因为experienced_thresholds是gumbel perturbed value，本身也包含常数，所以就消掉了
-        experience_sample_probs = (1 - torch.exp(-torch.exp(combo_logits - experienced_thresholds))).detach()
+        experience_sample_probs = (1 - torch.exp(-torch.exp(combo_logits - experienced_thresholds.unsqueeze(-1)))).detach()
         # print("experience_sample_probs.min = ", experience_sample_probs.min().detach().cpu().numpy())
         normalized_factor = 1 + torch.sum(combo_probs * (torch.exp(transformed_advantages) - 1), axis=-1, keepdim=True)
         policy_prob_mpo = ((combo_probs * torch.exp(transformed_advantages) / normalized_factor)).detach()
-        policy_loss = -torch.mean(torch.sum(policy_prob_mpo / (experience_sample_probs+1e-8) * torch.log(combo_probs + 1e-8), axis=-1))
+        policy_loss = -torch.mean(torch.sum(policy_prob_mpo / (experience_sample_probs+1e-8) * torch.log(combo_probs), axis=-1))
         
         with torch.no_grad():
             target_values, _ = self.predict_value(next_states, new_critic_hidden_states.view(-1, self.hidden_dim), use_target=True)
-            target_values = rewards + gamma * target_values.squeeze(-1) * (1 - dones)
+            target_values = rewards + gamma**self.c_step * target_values.squeeze(-1) * (1 - dones)
         
         value_loss = nn.MSELoss()(predicted_values.squeeze(-1), target_values)
-        # 总损失 (可以调整权重)
-        total_loss = policy_loss + value_loss_weight * value_loss
+        
+        # 将熵正则化加入总损失中，通过减去来促进更高的熵
+        # 熵是负值，所以减去会增加总损失
+        total_loss = policy_loss + value_loss_weight * value_loss - entropy_weight * entropy
         
         # 更新策略网络参数
         self.optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(self.policy_network.parameters()) + list(self.critic_network.parameters()), max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.policy_network.parameters(), max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.critic_network.parameters(), max_grad_norm)
         self.optimizer.step()
+
         loss_dict = {
             "policy_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
+            "entropy": entropy.item()*entropy_weight,
             "total_loss": total_loss.item()
         }
         return loss_dict
@@ -506,8 +518,8 @@ class ReplayBufferList:
             self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size: int) -> list:
-        sample_size = max(batch_size // self.replay_buffer_list[0].batch_size, 1)
-        assert len(self.replay_buffer_list) >= batch_size, "No enough data to sample."
+        sample_size = max(batch_size, 1)
+        assert len(self.replay_buffer_list) >= sample_size, "No enough data to sample."
         indices = np.random.choice(len(self.replay_buffer_list), sample_size, replace=False)
         sampled_data = []
         for i in indices:
@@ -528,7 +540,7 @@ def compute_prior_from_qvalues(q_values: np.ndarray, temperature: float = 0.5, m
     return np.exp(q_values / temperature) / np.sum(np.exp(q_values / temperature), axis=-1, keepdims=True)
 
 def prepare_batch_data(sampled_batch: Tuple,
-                       max_visit_init: float = 50.0,
+                       max_visit_init: float = 50.00,
                        value_scale: float = 0.1,
                        use_real_data: bool = False) -> Tuple:
     """
@@ -562,8 +574,7 @@ def prepare_batch_data(sampled_batch: Tuple,
     for entry in sampled_batch:
         if not use_real_data:
 
-            policy_output, experienced_threshold, advantage, \
-                root_policy_h, root_critic_h = entry
+            policy_output, experienced_threshold, advantage, root_policy_h, root_critic_h = entry
         else:
             (policy_output, experienced_threshold, advantage,
              root_policy_h, root_critic_h,

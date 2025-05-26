@@ -2,3 +2,7 @@
 dataset
 .vscode
 results
+sc2_model_3m_5m
+smacv2
+mcts_wandb_offline_run
+OMAR

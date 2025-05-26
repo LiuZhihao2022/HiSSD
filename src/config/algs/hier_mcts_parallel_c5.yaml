@@ -77,10 +77,10 @@ adaptation: False
 debug: False
 
 # -----------------------hier-mcts params-----------------------
-batch_size: 2 # specially for episode runner
-batch_size_run: 2
+batch_size: 8 # specially for episode runner
+batch_size_run: 8
 c_step: 5
-# load_wm_path: "/home/liuzhihao/HiSSD/results/hier_mcts/sc2/marine-easy-expert/3m-expert/mcts/mcts_2025-04-18_19-25-27/models/251000"
+# load_wm_path: "/home/lzh/HiSSD/results/hier_mcts/sc2/marine-easy-expert/3m-expert/mcts/mcts_2025-04-18_19-25-27/models/251000"
 load_wm_path: ""
 use_offline_training: True
 use_online_mcts: False # 暂时wm和mcts分开学, 只学stage 1
@@ -103,5 +103,5 @@ offline_value_anneal_time: 500000
 save_model_interval_online: 50000
 test_nepisode_online: 20
 test_interval_online: 50000
-compute_infonce: True
+compute_infonce: False
 use_wandb: True

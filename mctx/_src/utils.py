@@ -5,7 +5,8 @@ from typing import List, Tuple
 import torch
 import jax
 import jax.numpy as jnp
-
+# import warnings
+# warnings.filterwarnings("error", category=RuntimeWarning)
 def compute_offline_value_weight(t: int, offline_value_start: float, offline_value_end: float, offline_value_anneal_time: int) -> float:
     """
     计算随着时间的推移而衰减的offline value权重
@@ -93,7 +94,6 @@ def convert_tree_to_graph(
   return graph
 
 
-
 def stochastic_top_k_sampling(
     n_agents: int,
     policy_rnn,
@@ -101,6 +101,7 @@ def stochastic_top_k_sampling(
     policy_hidden_states: np.ndarray,
     max_actions: int,
     k: int,
+    avail_skills=None # shape : [bs, n_agents, n_actions]
 ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Implements Algorithm 1: Stochastically sample top-k joint actions without replacement.
@@ -112,6 +113,7 @@ def stochastic_top_k_sampling(
         policy_hidden_states (np.ndarray) : Hidden states of shape [batch_size, num_agents, hidden_dim].
         max_actions (int): Maximum number of actions per agent.
         k (int): Number of joint actions to sample.
+        avail_skills (np.ndarray, optional): Boolean mask of available actions with shape [batch_size, n_agents, n_actions].
 
     Returns:
         List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]: Top-k joint actions, their log probabilities, and Gumbel values.
@@ -125,33 +127,69 @@ def stochastic_top_k_sampling(
     # new_policy_hidden_states = new_policy_hidden_states.detach().cpu().numpy()
     for agent_idx in range(n_agents):
         for b in range(batch_size):
-          queue = batched_queue[b]
-          expansions = []
-          for partial_action, log_prob, gumbel_value in queue:
-              to_expanded = []
-              Z = -float("inf")  # Track max Gumbel noise
+            queue = batched_queue[b]
+            expansions = []
+            for partial_action, log_prob, gumbel_value in queue:
+                to_expanded = []
+                Z = -float("inf")  # Track max Gumbel noise
 
-              for action_idx in range(max_actions):
-                  # Update expansions
-                  new_partial_action = partial_action + [action_idx]
-                  new_log_prob = log_prob + logits[b, agent_idx, action_idx]
+                for action_idx in range(max_actions):
+                    # 检查动作是否可用
+                    if avail_skills is not None and not avail_skills[b, agent_idx, action_idx]:
+                        continue  # 跳过不可用的动作
+                        
+                    # Update expansions
+                    new_partial_action = partial_action + [action_idx]
+                    new_log_prob = log_prob + logits[b, agent_idx, action_idx]
 
-                  # Compute Gumbel noise and perturbed value
-                  perturbed_value = np.random.gumbel(loc=new_log_prob, scale=1.0, size=1)
-                  Z = max(Z, perturbed_value)
-                  to_expanded.append((new_partial_action, new_log_prob, perturbed_value))
+                    # Compute Gumbel noise and perturbed value
+                    perturbed_value = new_log_prob + np.random.gumbel(loc=0.)
+                    Z = max(Z, perturbed_value)
+                    to_expanded.append((new_partial_action, new_log_prob, perturbed_value))
+                
+                # 处理该agent所有动作都不可用的极端情况
+                if len(to_expanded) == 0 and avail_skills is not None:
+                    # 如果没有可用动作，选择第一个动作（或者可以设置一个默认动作）
+                    action_idx = 0
+                    new_partial_action = partial_action + [action_idx]
+                    # 为不可用动作设置极低的概率（对应的logit）
+                    new_log_prob = log_prob - 1000.0  # 一个非常小的值
+                    perturbed_value = new_log_prob + np.random.gumbel(loc=0.)
+                    to_expanded.append((new_partial_action, new_log_prob, perturbed_value))
+                
+                # Recalculate adjusted Gumbel values for all expansions
+                if agent_idx!= n_agents - 1:
+                # if True:
+                    for j, (partial_action, log_prob, perturbed_value) in enumerate(to_expanded):
+                        # 对于已经结束的env，这个地方会报错RuntimeWarning，因为Z是-inf。但是不用管，这个东西后面模拟出来的结果，
+                        # 在mct搜索完之后，会由env_indice过滤掉，不会进入训练
+                        adjusted_gumbel = -np.log(
+                            np.exp(-gumbel_value) - np.exp(-Z) + np.exp(-perturbed_value)
+                        )
+                        # print(f"action_idx: {action_idx}, perturbed_value: {perturbed_value}")
+                        # TODO: 这个新的adjusted_gumbel，和通过logit并且gumbel采样得到的value，两个是可比的吗？
+                        expansions.append((partial_action, log_prob, adjusted_gumbel))
+                else:
+                   expansions.extend(to_expanded)
 
-              # Recalculate adjusted Gumbel values for all expansions
-              for j, (partial_action, log_prob, gumbel_value) in enumerate(to_expanded):
-                  adjusted_gumbel = -np.log(
-                      np.exp(-gumbel_value) - np.exp(-Z) + np.exp(-gumbel_value)
-                  )
-                  expansions.append((partial_action, log_prob, adjusted_gumbel))
-
-          # Sort expansions by adjusted Gumbel values and keep top-k
-          expansions.sort(key=lambda x: x[2], reverse=True)
-          batched_queue[b] = expansions[:k]
-
+            # Sort expansions by adjusted Gumbel values and keep top-k
+            expansions.sort(key=lambda x: x[2], reverse=True)
+            batched_queue[b] = expansions[:k]
+    
+    # Check if each batch's queue has exactly k items
+    for b in range(batch_size):
+        if len(batched_queue[b]) < k:
+            # Need to sample with replacement to reach k
+            current_items = batched_queue[b]
+            if len(current_items) > 0:  # Only sample if there's at least one item
+                num_to_sample = k - len(current_items)
+                # Sample indices with replacement
+                sampled_indices = np.random.choice(len(current_items), size=num_to_sample, replace=True)
+                # Add the sampled items to the queue
+                for idx in sampled_indices:
+                    batched_queue[b].append(current_items[idx])
+            batched_queue[b].sort(key=lambda x: x[2], reverse=True)
+    
     return batched_queue, new_policy_hidden_states
 
 @jax.vmap

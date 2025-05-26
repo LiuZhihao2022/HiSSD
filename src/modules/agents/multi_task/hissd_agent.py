@@ -104,20 +104,21 @@ class HISSDAgent(nn.Module):
 
     # TODO: 放到gumble-muzero中时就要看这里，是否
     def forward_planner(self, inputs, states, t, task, hidden_state_plan,
-                        actions=None, next_inputs=None, next_states=None, loss_out=False, skill_index_out=False):
+                        actions=None, next_inputs=None, next_states=None, loss_out=False, skill_index_out=False, training=True, external_skill_index=None):
         # 始终获取所有可能的返回值
-        out_h, h, obs_loss, skill_index = self.planner(inputs, states, t, task, hidden_state_plan,
+        out_h, h, obs_loss, skill_index, loss_dict = self.planner(inputs, states, t, task, hidden_state_plan,
                                           next_inputs=next_inputs,next_states=next_states, actions=actions, loss_out=loss_out, 
-                                          skill_index_out=skill_index_out)
+                                          skill_index_out=skill_index_out, training=training, external_skill_index=external_skill_index)
         
         # 根据参数设置返回值
         if not skill_index_out:
             skill_index = None
             
-        return out_h, h, obs_loss, skill_index
+        return out_h, h, obs_loss, skill_index, loss_dict
 
-    def forward_planner_feedforward(self, emb_inputs, forward_type='action', additional_input= None, task=None):
-        out_h = self.planner.feedforward(emb_inputs, forward_type=forward_type, additional_input=additional_input, task=task)
+    def forward_planner_feedforward(self, emb_inputs, forward_type='action', additional_input= None, task=None, adaptation=False):
+        # out_h = self.planner.feedforward(emb_inputs, forward_type=forward_type, additional_input=additional_input, task=task)
+        out_h = self.planner.feedforward(emb_inputs, forward_type=forward_type, additional_input=additional_input, task=task, adaptation=adaptation)
         return out_h
 
     def forward_discriminator(self, inputs, t, task, hidden_state_dis):
@@ -128,28 +129,28 @@ class HISSDAgent(nn.Module):
         logits = self.discr.compute_logits(inputs, inputs_pos)
         return logits
     # hidden_state_dis不使用，直接返回了
-    def forward(self, inputs, hidden_state_dec, hidden_state_dis, t, task, skill,hidden_state_plan=None,
+    def forward(self, inputs, states, hidden_state_dec, hidden_state_dis, t, task, skill, hidden_state_plan=None,
                 mask=False, actions=None, local_obs=None, test_mode=None, skill_index_out=False):
         # TODO: 这里要进行修改，将skill在forward函数中得到并传出到外面。并且只有在t%c=0的时候才计算skill
-        if (hidden_state_plan is None) == (skill is None):
-            raise ValueError("Either hidden_state_plan or skill must be None, but not both.")
+        # if (hidden_state_plan is None) == (skill is None):
+        #     raise ValueError("Either hidden_state_plan or skill must be None, but not both.")
 
-        if skill is None:
-            if t % self.c == 0:
-                # h_plan是hidden_state_plan
-                out_h, h_plan, _, skill_index = self.forward_planner(
-                    inputs, t, task, skill_index_out, hidden_state_plan=hidden_state_plan, actions=actions)
+        
+        if t % self.c == 0:
+            if skill is None:
+            # h_plan是hidden_state_plan
+                out_h, h_plan, _, skill_index, loss_dict = self.forward_planner(
+                    inputs, states, t, task, skill_index_out=skill_index_out, hidden_state_plan=hidden_state_plan, actions=actions)
                 # 上一行是得到skill的表示，这一行是将skill融合得到真正的action code。在下面通过decoder解码成单独的action
-                out_h = self.forward_planner_feedforward(out_h)
+                out_h = self.forward_planner_feedforward(out_h, forward_type='action', additional_input=inputs, task=task)
                 # TODO: 将skill维护在动作选择里面，就不用在外面显示保存skill了。我是要将这一步skill的选择替换为MCTS
                 self.last_out_h, self.last_h_plan = out_h, h_plan
-        else:
-            self.last_out_h = skill
-            h_plan = hidden_state_plan
-        # _, discr_h, h_dis = self.forward_discriminator(inputs, t, task, hidden_state_dis)
-        # discr_h  = discr_h.reshape(-1, 1, self.args.entity_embed_dim)
+            else:
+                # 这个是对没有skill传入的处理结果
+                self.last_out_h = skill
         act, h_dec = self.decoder(self.last_out_h, inputs, None, hidden_state_dec, task, mask, actions)
-        if skill_index_out == False:
+        # TODO: mask和actions的作用是什么？这里为什么是False和None？
+        if skill_index_out == False or t % self.c != 0:
             return act, self.last_h_plan, h_dec, hidden_state_dis, None
         else:
             return act, self.last_h_plan, h_dec, hidden_state_dis, skill_index
@@ -739,7 +740,7 @@ class Decoder(nn.Module):
         # total_hidden = th.cat([own_hidden, enemy_hidden, ally_hidden, emb_hidden], dim=1)
         outputs = self.transformer(total_hidden, None)
         h = outputs[:, -1, :]
-        outputs = outputs[:, : n_entity]
+        outputs = outputs[:, : n_entity]    # TODO: 为什么这个计算出来有那么多？这对吗?
 
         # cls_out = self.cls_fc(th.zeros_like(h).detach())
         # skill_hidden = discr_h.reshape(-1, 1, self.entity_embed_dim).repeat(1, outputs.shape[1], 1)
@@ -865,14 +866,22 @@ class PlannerModel(nn.Module):
         self.last_enemy = enemy
         self.last_ally = ally
 
-    def feedforward(self, inputs, forward_type='action', additional_input=None,task=None):
+    def feedforward(self, inputs, forward_type='action', additional_input=None,task=None, adaptation=False):
         assert forward_type in ['action', 'value', 'reward']
         own_emb_skill, enemy_emb_skill, ally_emb_skill = inputs
         n_enemy, n_ally = enemy_emb_skill.shape[1], ally_emb_skill.shape[1]
-        if forward_type == "reward" or forward_type == "value":
-            emb = self.state_encoder(additional_input,task)
-        elif forward_type == "action":
-            emb = self.obs_encoder(additional_input,task)
+        if adaptation:
+            # In adaptation mode, don't calculate gradients for encoder networks
+            with th.no_grad():
+                if forward_type == "reward" or forward_type == "value":
+                    emb = self.state_encoder(additional_input, task)
+                elif forward_type == "action":
+                    emb = self.obs_encoder(additional_input, task)
+        else:
+            if forward_type == "reward" or forward_type == "value":
+                emb = self.state_encoder(additional_input,task)
+            elif forward_type == "action":
+                emb = self.obs_encoder(additional_input,task)
         # emb = self.obs_encoder(additional_input,task)
         own_emb, enemy_emb, ally_emb = emb
         if additional_input is None:
@@ -894,7 +903,7 @@ class PlannerModel(nn.Module):
     # inputs就是obs+last_action+agent_id
     # next_inputs在原文中就是states，没有更改过。这里rec_module做的应该是根据skill和obs去重建未来的states
     def forward(self, inputs, states, t, task,hidden_state=None,
-                test=True, next_inputs=None, next_states = None, actions=None, loss_out=False, skill_index_out=False):
+                test=True, next_inputs=None, next_states = None, actions=None, loss_out=False, skill_index_out=False, training=True, external_skill_index=None):
         hidden_state = hidden_state.reshape(-1, 1, self.entity_embed_dim)
         # get decomposer, last_action_shape and n_agents of this specific task
         task_decomposer = self.task2decomposer[task]
@@ -964,7 +973,12 @@ class PlannerModel(nn.Module):
         commit_loss = th.tensor(0.).to(inputs.device)
         diver_loss = th.tensor(0.).to(inputs.device)
         if self.vq_skill:
-            outputs, skill_index, commit_loss, diver_loss = self.skill_module(outputs)
+            if external_skill_index is not None:
+                # 在这里,commit_loss恒等于0，因为不需要使计算出来的embedding接近某个codebook
+                outputs, commit_loss, diver_loss = self.skill_module.forward_with_skill_index(outputs, external_skill_index)
+                skill_index = external_skill_index
+            else:
+                outputs, skill_index, commit_loss, diver_loss = self.skill_module(outputs, training=training)
         else:
             skill_index = None  # 非VQ模式时返回None
         outputs = unsqueeze_mlp(outputs).reshape(outs_shape)
@@ -976,13 +990,16 @@ class PlannerModel(nn.Module):
         own_out, enemy_out, ally_out = own_out_h, enemy_out_h, ally_out_h
 
         out_loss = th.tensor(0.).to(inputs.device)
-        
+        rec_loss = th.tensor(0.).to(inputs.device)
         if next_inputs is not None and loss_out:
-            out_loss = self.rec_module([own_out, enemy_out, ally_out], original_inputs, next_inputs, states, next_states, 
+            rec_loss = self.rec_module([own_out, enemy_out, ally_out], original_inputs, next_inputs, states, next_states, 
                                        task, t=t, actions=actions)
-            out_loss += commit_loss + diver_loss
-        
-        return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, skill_index
+            out_loss = commit_loss + diver_loss + rec_loss
+        loss_dict = {"commit_loss": commit_loss.detach().cpu().item(), 
+                     "diver_loss": diver_loss.detach().cpu().item(), 
+                     "rec_loss": rec_loss.detach().cpu().item()}
+
+        return [own_out_h, enemy_out_h, ally_out_h], h, out_loss, skill_index, loss_dict
 
 
 class Discriminator(nn.Module):

@@ -7,6 +7,8 @@ from copy import deepcopy
 from sacred import Experiment, SETTINGS
 from sacred.observers import FileStorageObserver
 from sacred.utils import apply_backspaces_and_linefeeds
+SETTINGS.CONFIG.READ_ONLY_CONFIG = False
+SETTINGS['CAPTURE_MODE'] = 'no'
 import sys
 import torch as th
 from utils.logging import get_logger
@@ -17,8 +19,12 @@ import wandb  # 添加wandb导入
 from run import run as run
 from mto import run as mto
 from hier_mcts import run as hier_mcts_run
+from gumbel_online_train import run as gumbel_online_training
+from test_mcts_run import run as test_mcts_run
+from single_task_run import run as single_task_run
 SETTINGS['CAPTURE_MODE'] = "fd" # set to "no" if you want to see stdout/stderr in console
 
+# TODO: just for test, do not use offline mode
 os.environ["WANDB_MODE"] = "offline"
 
 logger = get_logger()
@@ -58,6 +64,12 @@ def my_main(_run, _config, _log):
         mto(_run, config, _log)
     elif config['run_file'].startswith('hier'):
         hier_mcts_run(_run, config, _log)
+    elif config['run_file'].startswith('gumbel'):
+        gumbel_online_training(_run, config, _log)
+    elif config['run_file'].startswith('test'):
+        test_mcts_run(_run, config, _log)
+    elif config['run_file'].startswith('single'):
+        single_task_run(_run, config, _log)
     else:
         run(_run, config, _log)
     
@@ -186,6 +198,33 @@ if __name__ == '__main__':
             config_dict['name'] + config_dict['remark'],
             unique_token
         )
+    elif config_dict['run_file'].startswith('gumbel'):
+        if config_dict['evaluate']:
+            results_path = os.path.join(results_path, 'evaluate')
+        results_save_dir = os.path.join(
+            results_path, "gumbel", config_dict['env'], config_dict['task'],
+            '+'.join([f'{k}-{v}' for k, v in config_dict['train_tasks_data_quality'].items()]),
+            config_dict['name'] + config_dict['remark'],
+            unique_token
+        )
+    elif config_dict['run_file'].startswith('test'):
+        if config_dict['evaluate']:
+            results_path = os.path.join(results_path, 'evaluate')
+        results_save_dir = os.path.join(
+            results_path, "test", config_dict['env'], config_dict['task'],
+            '+'.join([f'{k}-{v}' for k, v in config_dict['train_tasks_data_quality'].items()]),
+            config_dict['name'] + config_dict['remark'],
+            unique_token
+        )
+    elif config_dict['run_file'].startswith('single'):
+        if config_dict['evaluate']:
+            results_path = os.path.join(results_path, 'evaluate')
+        results_save_dir = os.path.join(
+            results_path, "single_task", config_dict['env'], config_dict['task'],
+            '+'.join([f'{k}-{v}' for k, v in config_dict['train_tasks_data_quality'].items()]),
+            config_dict['name'] + config_dict['remark'],
+            unique_token
+        )
     else:
         if config_dict['evaluate']:
             results_path = os.path.join(results_path, 'evaluate')
@@ -208,3 +247,4 @@ if __name__ == '__main__':
     ex.add_config(config_dict)
 
     ex.run_commandline(params)
+    # ex.run_commandline(params, options={"--capture": "no"})

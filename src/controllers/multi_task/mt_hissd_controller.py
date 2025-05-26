@@ -34,6 +34,7 @@ class HISSDSMAC:
         env2decomposer = {
             "sc2": "sc2_decomposer",
             "sc2v2": "sc2_decomposer_v2",
+            "mpe": "mpe_decomposer", # Add MPE entry
         }
         self.task2decomposer, self.task2dynamic_decoder = {}, {}
         self.surrogate_decomposer = None
@@ -54,6 +55,15 @@ class HISSDSMAC:
                 task_decomposer = decomposer_REGISTRY[env2decomposer[task_args.env]](env)
                 self.task2decomposer[task] = task_decomposer
                 if self.surrogate_decomposer is None:
+                    self.surrogate_decomposer = task_decomposer
+            elif task_args.env == "mpe": # Add MPE condition
+                # MPEDecomposer expects task_args (which has n_agents, obs_shape, etc.)
+                # and main_args for the BaseDecomposer
+                task_decomposer = decomposer_REGISTRY[env2decomposer[task_args.env]](
+                    task_args, self.main_args
+                )
+                self.task2decomposer[task] = task_decomposer
+                if not self.surrogate_decomposer:
                     self.surrogate_decomposer = task_decomposer
             else:
                 raise NotImplementedError(f"Unsupported env decomposer {task_args.env}")
@@ -103,11 +113,12 @@ class HISSDSMAC:
         # Only select actions for the selected batch elements in bs
         # 这里是得到具体的action，所以这里要使用ep_batch["avail_actions"]得到具体的action值，而不是avail_skills
         avail_actions = ep_batch["avail_actions"][:, t_ep]
-        agent_outputs = self.forward(ep_batch, t_ep, task, test_mode=test_mode)
+        agent_outputs, skill_index = self.forward(ep_batch, t_ep, task, test_mode=test_mode)
         chosen_actions = self.action_selector.select_action(
             agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode
         )
-        return chosen_actions
+        # return chosen_actions, skill_index.reshape(ep_batch.batch_size, -1)[bs].flatten()
+        return chosen_actions, skill_index.reshape(ep_batch.batch_size, -1).flatten()
 
     def forward_global_hidden(self, ep_batch, t, task, actions=None, test_mode=False):
         agent_inputs = ep_batch["state"][:, t]
@@ -199,10 +210,11 @@ class HISSDSMAC:
         task,
         actions=None,
         test_mode=False,
-        training=False,
+        training=True,
         hrl=False, # TODO:这个参数在训练VAE的时候一定要开启，不然每次都会进行skill的选择
         loss_out=False,
         skill_index_out=False, # 参数，控制是否返回skill_index
+        external_skill_index=None, # 新增参数，允许外部指定skill_index
     ):
         # 移除了return_pred参数及相关逻辑
         if t % self.c_step == 0 or hrl == False:
@@ -213,12 +225,12 @@ class HISSDSMAC:
             next_inputs = None
             next_states = None
             if training:  # 只在训练模式下获取next_inputs用于计算损失
-                # if t + self.c_step < ep_batch["obs"].shape[1]:  # 确保不会越界
-                next_inputs = ep_batch["obs"][:, t + self.c_step]
-                next_states = ep_batch["state"][:, t + self.c_step]
+                if t + self.c_step < ep_batch["obs"].shape[1]:  # 确保不会越界
+                    next_inputs = ep_batch["obs"][:, t + self.c_step]
+                    next_states = ep_batch["state"][:, t + self.c_step]
                 
-            # 修改调用方式
-            out_h, self.hidden_states_plan, obs_loss, skill_index = self.agent.forward_planner(
+            # 修改调用方式，支持external_skill_index
+            out_h, self.hidden_states_plan, obs_loss, skill_index, loss_dict = self.agent.forward_planner(
                 agent_inputs,
                 states,
                 t,
@@ -228,19 +240,21 @@ class HISSDSMAC:
                 next_inputs=next_inputs,
                 next_states=next_states,
                 loss_out=loss_out,
-                skill_index_out=skill_index_out
+                skill_index_out=skill_index_out,
+                training=training,
+                external_skill_index=external_skill_index
             )
             
             # 保存结果
             self.last_out_h, self.last_obs_loss = out_h, obs_loss
             self.last_skill_index = skill_index
 
-        return self.last_out_h, self.last_obs_loss, self.last_skill_index
+        return self.last_out_h, self.last_obs_loss, self.last_skill_index, loss_dict
     # additional_input可以根据forward_type选择不同的输入数据
     # 暂时都使用state作为additional_input
     # 作用：得到技能表示后，将技能与特定目的相结合，处理为特定种类(action, reward, value)的表示，辅助最终计算
-    def forward_planner_feedforward(self, emb_inputs, additional_input=None, forward_type="action",task=None):
-        out_h = self.agent.forward_planner_feedforward(emb_inputs, forward_type=forward_type, additional_input=additional_input, task=task)
+    def forward_planner_feedforward(self, emb_inputs, additional_input=None, forward_type="action",task=None, adaptation=False):
+        out_h = self.agent.forward_planner_feedforward(emb_inputs, forward_type=forward_type, additional_input=additional_input, task=task, adaptation=adaptation)
         return out_h
 
     def forward_discriminator(self, ep_batch, t, task, test_mode=False):
@@ -262,7 +276,7 @@ class HISSDSMAC:
         # 这里是通过skill得到具体的action，所以这里要使用ep_batch["avail_actions"]得到具体的action值，而不是avail_skills
         avail_actions = ep_batch["avail_actions"][:, t]
         actions = ep_batch["actions"][:, t]
-
+        states = ep_batch["state"][:, t]
         bs = agent_inputs.shape[0] // self.task2n_agents[task]
         # 看上去好像是有时间上抽象的? c_step个时间重新选一次skill
         # 留出了接口，但是在默认配置里c_step = 1，即每一个时间步都选择一次skill. To be implement
@@ -273,9 +287,10 @@ class HISSDSMAC:
                 self.hidden_states_plan,
                 self.hidden_states_dec,
                 self.hidden_states_dis,
-                self.skill,
+                self.skill_index,
             ) = self.agent(
                 agent_inputs,
+                states,
                 self.hidden_states_dec,
                 self.hidden_states_dis,
                 t,
@@ -284,6 +299,7 @@ class HISSDSMAC:
                 hidden_state_plan=self.hidden_states_plan,
                 actions=actions,
                 local_obs=None,
+                skill_index_out=True,
                 test_mode=test_mode,
             )
         else:
@@ -295,6 +311,7 @@ class HISSDSMAC:
                 _,
             ) = self.agent(
                 agent_inputs,
+                states,
                 self.hidden_states_dec,
                 self.hidden_states_dis,
                 t,
@@ -303,6 +320,7 @@ class HISSDSMAC:
                 hidden_state_plan=self.hidden_states_plan,
                 actions=actions,
                 local_obs=None,
+                skill_index_out=True,
                 test_mode=test_mode,
             )
 
@@ -337,10 +355,11 @@ class HISSDSMAC:
                     # Zero out the unavailable actions
                     agent_outs[reshaped_avail_actions == 0] = 0.0
 
-        return agent_outs.view(ep_batch.batch_size, self.task2n_agents[task], -1)
+        return agent_outs.view(ep_batch.batch_size, self.task2n_agents[task], -1), self.skill_index
 
     def init_hidden(self, batch_size, task):
         # we always know we are in which task when do init_hidden
+        # Mac中会维护一个自己的hidden state，但是agent不会，所以将Mac中的hidden state作为root，然后拷贝副本到agent中就可以了
         n_agents = self.task2n_agents[task]
         (
             hidden_states_value,
@@ -366,44 +385,44 @@ class HISSDSMAC:
         )
     # 不仅是initialize world model,还是forward action with skill 的 latent
     # TODO: 应该两个初始化的时机都是一样的，区别是wm latent需要存在tree buffer里，action的不用，存在self里即可
-    def init_hidden_wm(self, batch_size, task):
-        """
-        Initializes the hidden states for the world model (WM) of the agents 
-        for a specific task.
+    # def init_hidden_wm(self, batch_size, task):
+    #     """
+    #     Initializes the hidden states for the world model (WM) of the agents 
+    #     for a specific task.
 
-        Args:
-            batch_size (int): The number of samples in the batch.
-            task (str): The task identifier used to determine the number of agents.
+    #     Args:
+    #         batch_size (int): The number of samples in the batch.
+    #         task (str): The task identifier used to determine the number of agents.
 
-        Returns:
-            list: A list containing the initialized hidden states for reward and value 
-                  networks, each with dimensions expanded to match the batch size 
-                  and number of agents.
-        """
-        n_agents = self.task2n_agents[task]
-        (
-            hidden_states_value,
-            hidden_states_reward,
-            hidden_states_dec_for_act,
-            hidden_states_plan,
-            hidden_states_dis_for_act,
-        ) = self.agent.init_hidden()
-        hidden_states_value = hidden_states_value.unsqueeze(0).expand(
-            batch_size, n_agents, -1
-        )
-        hidden_states_reward = hidden_states_reward.unsqueeze(0).expand(
-            batch_size, n_agents, -1
-        )
-        self.hidden_states_dec_for_act = hidden_states_dec_for_act.unsqueeze(0).expand(
-            batch_size, n_agents, -1
-        )
-        self.hidden_states_dis_for_act = hidden_states_dis_for_act.unsqueeze(0).expand(
-            batch_size, n_agents, -1
-        )
-        hidden_states_reward = hidden_states_reward.unsqueeze(1)
-        hidden_states_value = hidden_states_value.unsqueeze(1)
-        hidden_state_wm = th.cat([hidden_states_reward, hidden_states_value], dim=1)
-        return hidden_state_wm
+    #     Returns:
+    #         list: A list containing the initialized hidden states for reward and value 
+    #               networks, each with dimensions expanded to match the batch size 
+    #               and number of agents.
+    #     """
+    #     n_agents = self.task2n_agents[task]
+    #     (
+    #         hidden_states_value,
+    #         hidden_states_reward,
+    #         hidden_states_dec_for_act,
+    #         hidden_states_plan,
+    #         hidden_states_dis_for_act,
+    #     ) = self.agent.init_hidden()
+    #     hidden_states_value = hidden_states_value.unsqueeze(0).expand(
+    #         batch_size, n_agents, -1
+    #     )
+    #     hidden_states_reward = hidden_states_reward.unsqueeze(0).expand(
+    #         batch_size, n_agents, -1
+    #     )
+    #     self.hidden_states_dec_for_act = hidden_states_dec_for_act.unsqueeze(0).expand(
+    #         batch_size, n_agents, -1
+    #     )
+    #     self.hidden_states_dis_for_act = hidden_states_dis_for_act.unsqueeze(0).expand(
+    #         batch_size, n_agents, -1
+    #     )
+    #     hidden_states_reward = hidden_states_reward.unsqueeze(1)
+    #     hidden_states_value = hidden_states_value.unsqueeze(1)
+    #     hidden_state_wm = th.cat([hidden_states_reward, hidden_states_value], dim=1)
+    #     return hidden_state_wm
 
     def parameters(self):
         return self.agent.parameters()
@@ -436,6 +455,12 @@ class HISSDSMAC:
         # 加载mixer参数
         if self.mixer is not None:
             self.mixer.load_state_dict(
+                th.load(
+                    "{}/mixer.th".format(path),
+                    map_location=lambda storage, loc: storage,
+                )
+            )
+            self.target_mixer.load_state_dict(
                 th.load(
                     "{}/mixer.th".format(path),
                     map_location=lambda storage, loc: storage,
@@ -505,7 +530,7 @@ class HISSDSMAC:
             last_action_shape, agent_id_shape = 0, 0
             if self.task2args[task].obs_last_action:
                 input_shape += task_scheme["actions_onehot"]["vshape"][0]
-                input_shape_skill += task_scheme["skills_onehot"]["vshape"][0]
+                # input_shape_skill += task_scheme["skills_onehot"]["vshape"][0]
                 last_action_shape = task_scheme["actions_onehot"]["vshape"][0]
                 last_skill_shape = task_scheme["skills_onehot"]["vshape"][0]
             if self.task2args[task].obs_agent_id:
@@ -528,14 +553,18 @@ class HISSDSMAC:
         bs: None（默认全batch），或list/slice（子batch）。
         """
         # 处理bs参数
-        if bs is None:
-            agent_inputs = self._build_inputs(ep_batch, t, task)
-            avail_actions = ep_batch["avail_actions"][:, t]
-            batch_size = ep_batch.batch_size
-        else:
-            agent_inputs = self._build_inputs(ep_batch[bs], t, task)
-            avail_actions = ep_batch[bs]["avail_actions"][:, t]
-            batch_size = len(bs) if isinstance(bs, list) else ep_batch[bs].batch_size
+        # if bs is None:
+        #     agent_inputs = self._build_inputs(ep_batch, t, task)
+        #     avail_actions = ep_batch["avail_actions"][:, t]
+        #     batch_size = ep_batch.batch_size
+        # else:
+        #     agent_inputs = self._build_inputs(ep_batch[bs], t, task)
+        #     avail_actions = ep_batch[bs]["avail_actions"][:, t]
+        #     batch_size = len(bs) if isinstance(bs, list) else ep_batch[bs].batch_size
+        agent_inputs = self._build_inputs(ep_batch, t, task)
+        avail_actions = ep_batch["avail_actions"][:, t]
+        actions = ep_batch["actions"][:, t]
+        batch_size = ep_batch.batch_size
 
         device = agent_inputs.device
         skill_index = np.array(skill_index)
@@ -559,48 +588,60 @@ class HISSDSMAC:
         )
 
         # prepare hidden states for action
-        dec = self.hidden_states_dec_for_act
-        dis = self.hidden_states_dis_for_act
-        if bs is not None:
-            # dec/dis shape: [batch*n_agents, dim] -> [batch, n_agents, dim]
-            dim = dec.size(-1)
-            dec = dec.reshape(-1, n_agents, dim)[bs].reshape(-1, dim)
-            dis = dis.reshape(-1, n_agents, dim)[bs].reshape(-1, dim)
-
-        (
-            agent_outs,
-            _,
-            new_dec,
-            new_dis,
-            _
-        ) = self.agent(
-            agent_inputs,
-            dec,
-            dis,
-            t,
-            task,
-            action_out_h,
-        )
+        # if bs is not None:
+        #     # dec/dis shape: [batch*n_agents, dim] -> [batch, n_agents, dim]
+        #     dim = dec.size(-1)
+        #     dec = dec.reshape(-1, n_agents, dim)[bs].reshape(-1, dim)
+        #     dis = dis.reshape(-1, n_agents, dim)[bs].reshape(-1, dim)
+        if t % self.c_step == 0:
+            (
+                agent_outs,
+                _,
+                # self.hidden_states_dec_for_act,
+                # self.hidden_states_dis_for_act,
+                self.hidden_states_dec,
+                self.hidden_states_dis,
+                _
+            ) = self.agent(
+                agent_inputs,
+                None, # No states needed for action selection
+                # hidden_state_dec = self.hidden_states_dec_for_act,
+                # hidden_state_dis = self.hidden_states_dis_for_act,
+                hidden_state_dec = self.hidden_states_dec,
+                hidden_state_dis = self.hidden_states_dis,
+                t=t,
+                task=task,
+                skill=action_out_h,
+                local_obs=None,
+                skill_index_out=False,
+                test_mode=True,
+            )
+        else:
+            (
+                agent_outs,
+                _,
+                # self.hidden_states_dec_for_act,
+                # self.hidden_states_dis_for_act,
+                self.hidden_states_dec,
+                self.hidden_states_dis,
+                _
+            ) = self.agent(
+                agent_inputs,
+                None, # No states needed for action selection
+                # hidden_state_dec = self.hidden_states_dec_for_act,
+                # hidden_state_dis = self.hidden_states_dis_for_act,
+                hidden_state_dec = self.hidden_states_dec,
+                hidden_state_dis = self.hidden_states_dis,
+                t=t,
+                task=task,
+                skill=None,
+                local_obs=None,
+                skill_index_out=False,
+                test_mode=True,
+            )
 
         # Update hidden states
-        if bs is None:
-            # If working with full batch, just replace hidden states
-            self.hidden_states_dec_for_act = new_dec
-            self.hidden_states_dis_for_act = new_dis
-        else:
-            # If working with subset of batch, update only those parts
-            dim = new_dec.size(-1)
-            # Reshape to [batch, n_agents, dim] to update specific batch indices
-            dec_reshaped = self.hidden_states_dec_for_act.reshape(-1, n_agents, dim)
-            dis_reshaped = self.hidden_states_dis_for_act.reshape(-1, n_agents, dim)
-            dec_reshaped = dec_reshaped.clone()
-            dis_reshaped = dis_reshaped.clone()
-            dec_reshaped[bs] = new_dec.reshape(-1, n_agents, dim)
-            dis_reshaped[bs] = new_dis.reshape(-1, n_agents, dim)
-            
-            # Reshape back to original shape
-            self.hidden_states_dec_for_act = dec_reshaped.reshape(-1, dim)
-            self.hidden_states_dis_for_act = dis_reshaped.reshape(-1, dim)
+
         if self.agent_output_type == "pi_logits":
             if getattr(self.main_args, "mask_before_softmax", True):
                 reshaped_avail_actions = avail_actions.reshape(
@@ -704,7 +745,7 @@ class HISSDSMAC:
             # 使用MergeRec的pred_next方法预测下一步观察
             
             # 预测下一步观察
-            # batch_obs.reshape(-1, batch_obs_shape[-1])
+            # batch_obs.reshape(-1, batch_obs.shape[-1])
             # Split batch_obs into obs, last-action and agent-id parts
             shape_info = self._get_input_shape()[task]
             obs_dim = self.task2args[task].obs_shape
@@ -728,7 +769,9 @@ class HISSDSMAC:
             # next_obs = next_obs.reshape(batch_obs.shape)
             # TODO: 这个state的shape不是完全由obs组成的！需要修改以前的部分以使用obs拼接的state
             # next_state = next_obs.reshape(bs, -1)
+            # 这里要加one hot编码,因为forward_value需要
             next_obs_input = [next_obs, one_hot_code, agent_id]
+            # next_obs_input = [next_obs, agent_id]
             next_obs_input = th.cat([x.reshape(bs * n_agents, -1) for x in next_obs_input], dim=1)
             # 创建一个简单的batch字典来传递数据
             # temp_batch = {
@@ -747,18 +790,21 @@ class HISSDSMAC:
             )
             reward_pred = reward_pred.reshape(bs, n_agents).sum(dim=1)
             
-            # 新增: 使用HISSDAgent的forward_value_skill预测价值
+            # 新增: 使用HISSDAgent的forward_value预测价值
             # 为value预测准备输入
-            # TODO: value的预测是使用这个函数还是forward_value函数？
-            
-            value_out_h = self.forward_planner_feedforward(
-                all_skill, additional_input=batch_state, forward_type="value",task=task
+
+            # value的预测是使用forward_value函数
+            # value_out_h = self.forward_planner_feedforward(
+            #     all_skill, additional_input=next_state, forward_type="value",task=task
+            # )
+            # batch_emb_value = th.cat(value_out_h, dim=1)
+            # value_pred_pre, hidden_state_value = self.agent.forward_value_skill(
+            #     batch_emb_value, hidden_state_value, task
+            # )
+            value_pred_pre, hidden_state_value = self.agent.forward_value(
+                next_obs_input, hidden_state_value, task
             )
-            batch_emb_value = th.cat(value_out_h, dim=1)
-            value_pred_pre, hidden_state_value = self.agent.forward_value_skill(
-                batch_emb_value, hidden_state_value, task
-            )
-            value_pred = self.mixer(value_pred_pre.reshape(bs, 1, n_agents, -1), batch_state.reshape(bs , 1 ,batch_state.shape[-1]), self.task2decomposer[task])
+            value_pred = self.mixer(value_pred_pre.reshape(bs, 1, n_agents, -1), next_state.reshape(bs , 1 ,next_state.shape[-1]), self.task2decomposer[task])
             value_pred = value_pred.reshape(bs, )
             # update hidden state
             hidden_state_reward = hidden_state_reward.reshape(hidden_state_shape).unsqueeze(1)

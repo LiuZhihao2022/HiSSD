@@ -80,7 +80,7 @@ debug: False
 batch_size: 8 # specially for episode runner
 batch_size_run: 8
 c_step: 3
-# load_wm_path: "/home/liuzhihao/HiSSD/sc2_model_3m_5m/marine-easy-expert/3m-expert/mcts/mcts_2025-04-18_19-25-27/models/251000"
+# load_wm_path: "/home/lzh/HiSSD/sc2_model_3m_5m/marine-easy-expert/3m-expert/mcts/mcts_2025-04-18_19-25-27/models/251000"
 load_wm_path: ""
 use_offline_training: True
 use_online_mcts: False # 暂时wm和mcts分开学, 只学stage 1

@@ -408,14 +408,16 @@ def train_online_mcts(
     model_save_time = 0
     last_test_T = t_start
     last_log_T = t_start
+    last_target_update_T = t_start
     start_time = time.time()
     last_time = start_time
     test_time_total = 0
     
     # 初始化MCTS网络和经验回放缓冲区
     mcts_network = None
-    replay_buffer_list = ReplayBufferList(capacity=main_args.replay_buffer_list_capacity//main_args.batch_size if hasattr(main_args, "replay_buffer_list_capacity") else 100, use_real_data=True)
-    target_update_interval = main_args.target_update_interval if hasattr(main_args, "target_update_interval") else 20
+    replay_buffer_list = ReplayBufferList(capacity=main_args.replay_buffer_list_capacity if hasattr(main_args, "replay_buffer_list_capacity") else 100, use_real_data=True)
+    # target_update_interval = main_args.target_update_interval if hasattr(main_args, "target_update_interval") else 200
+    mcts_target_update_interval = main_args.mcts_target_update_interval if hasattr(main_args, "mcts_target_update_interval") else 80
     
     # 获取一些常用参数
     batch_size_run = main_args.batch_size_run
@@ -466,12 +468,20 @@ def train_online_mcts(
                 emb_input_shape=state_shape,
                 output_shape=main_args.skill_dim,
                 num_agents=n_agents,
+                c_step=mac.c_step,
                 device=main_args.device,
                 optimizer='adam',
                 hidden_dim=main_args.hidden_dim if hasattr(main_args, "hidden_dim") else 128,
                 seed=main_args.seed if hasattr(main_args, "seed") else 42
             )
             mcts_network.init_hidden(batch_size=batch_size_run)
+        
+        if main_args.mcts_network_path != "":
+            # 加载预训练的MCTS网络参数
+            mcts_network.load_state_dict(th.load(os.path.join(main_args.mcts_network_path, "mcts_network.th"), map_location=main_args.device))
+            mcts_network.update_target_network()
+            logger.console_logger.info(f"Loaded MCTS network from {main_args.mcts_network_path}")
+
         # 设置runner，传入learner的MAC作为基础策略
         mcts_task2runner[task].setup(
             scheme=task2scheme[task],
@@ -596,7 +606,9 @@ def train_online_mcts(
             policy_loss = loss_dict.get("policy_loss", 0.0)
             value_loss = loss_dict.get("value_loss", 0.0)
             
-            logger.log_stat("mcts_network_loss", loss, current_t_env)
+            logger.log_stat("loss", loss, current_t_env)
+            logger.log_stat("policy_loss", policy_loss, current_t_env)
+            logger.log_stat("value_loss", value_loss, current_t_env)
             # mcts_train_stats["loss"].append(loss)
             # mcts_train_stats["policy_loss"].append(policy_loss)
             # mcts_train_stats["value_loss"].append(value_loss)
@@ -614,9 +626,10 @@ def train_online_mcts(
             train_count += 1
             
             # 定期更新目标网络
-            if train_count % target_update_interval == 0:
+            if (episode - last_target_update_T) / mcts_target_update_interval >= 1:
+                last_target_update_T = episode
                 mcts_network.update_target_network()
-                logger.console_logger.info(f"Updated MCTS network target at t_env: {current_t_env}")
+                logger.console_logger.info(f"Updated MCTS network target at t_env: {current_t_env}, episode: {episode}")
                 
             # 定期记录平均损失，记录平均损失后清空mcts_train_stats。这个是只有可以训练的时候才记录，还不能和下面的logger记录相合并
             # if (current_t_env - last_log_T) >= main_args.log_interval:
@@ -635,89 +648,89 @@ def train_online_mcts(
         # 定期测试 - 使用online专用的测试间隔
         if (current_t_env - last_test_T) / test_interval_online >= 1 or current_t_env >= main_args.online_steps:
             test_start_time = time.time()
+            # TODO: just for test, do not test now
+            # # 清空本轮测试统计数据
+            # for task in test_tasks:
+            #     test_stats[task]["returns"] = []
+            #     test_stats[task]["win_rates"] = []
+            #     test_stats[task]["lengths"] = []
             
-            # 清空本轮测试统计数据
-            for task in test_tasks:
-                test_stats[task]["returns"] = []
-                test_stats[task]["win_rates"] = []
-                test_stats[task]["lengths"] = []
+            # logger.console_logger.info(f"------- Testing at t_env={current_t_env} -------")
             
-            logger.console_logger.info(f"------- Testing at t_env={current_t_env} -------")
-            
-            with th.no_grad():
-                for task in test_tasks:
-                    mcts_task2runner[task].t_env = current_t_env
+            # with th.no_grad():
+            #     for task in test_tasks:
+            #         mcts_task2runner[task].t_env = current_t_env
                     
-                    # 执行测试episode
-                    for _ in range(n_test_runs):
-                        episode_data = mcts_task2runner[task].run(test_mode=True)
-                        _, _, stats_info = episode_data
+            #         # 执行测试episode
+            #         for _ in range(n_test_runs):
+            #             episode_data = mcts_task2runner[task].run(test_mode=True)
+            #             _, _, stats_info = episode_data
                         
-                        # 收集测试统计信息
-                        test_stats[task]["returns"].append(stats_info["episode_return"])
-                        test_stats[task]["lengths"].append(stats_info["episode_length"])
+            #             # 收集测试统计信息
+            #             test_stats[task]["returns"].append(stats_info["episode_return"])
+            #             test_stats[task]["lengths"].append(stats_info["episode_length"])
                         
-                        if stats_info["win_rate"] is not None:
-                            test_stats[task]["win_rates"].append(stats_info["win_rate"])
+            #             if stats_info["win_rate"] is not None:
+            #                 test_stats[task]["win_rates"].append(stats_info["win_rate"])
             
-            # 记录测试统计到控制台 - 只显示测试结果
-            logger.console_logger.info("Test Results Summary:")
-            for task in test_tasks:
-                task_mean_test_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
-                task_std_test_return = np.std(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+            # # 记录测试统计到控制台 - 只显示测试结果
+            # logger.console_logger.info("Test Results Summary:")
+            # for task in test_tasks:
+            #     task_mean_test_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+            #     task_std_test_return = np.std(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
                 
-                win_msg = ""
-                if test_stats[task]["win_rates"]:
-                    test_win_rate = np.mean(test_stats[task]["win_rates"])
-                    win_msg = f", Win Rate: {test_win_rate:.3f}"
+            #     win_msg = ""
+            #     if test_stats[task]["win_rates"]:
+            #         test_win_rate = np.mean(test_stats[task]["win_rates"])
+            #         win_msg = f", Win Rate: {test_win_rate:.3f}"
                 
-                logger.console_logger.info(
-                    f"Task {task} - Return: {task_mean_test_return:.3f} ± {task_std_test_return:.3f}{win_msg}"
-                )
+            #     logger.console_logger.info(
+            #         f"Task {task} - Return: {task_mean_test_return:.3f} ± {task_std_test_return:.3f}{win_msg}"
+            #     )
             
-            # 记录测试统计到wandb - 只记录测试数据
-            if use_wandb:
-                # all_test_returns = []
-                # all_test_wins = []
+            # # 记录测试统计到wandb - 只记录测试数据
+            # if use_wandb:
+            #     # all_test_returns = []
+            #     # all_test_wins = []
                 
-                # 只准备测试数据
-                test_data = {}
+            #     # 只准备测试数据
+            #     test_data = {}
                 
-                for task in test_tasks:
-                    # 计算测试统计均值
-                    task_mean_test_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
-                    task_std_test_return = np.std(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+            #     for task in test_tasks:
+            #         # 计算测试统计均值
+            #         task_mean_test_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+            #         task_std_test_return = np.std(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
                     
-                    # 记录测试数据
-                    test_data[f"test/{task}/mean_return"] = task_mean_test_return
-                    test_data[f"test/{task}/std_return"] = task_std_test_return
-                    test_data[f"test/{task}/mean_length"] = np.mean(test_stats[task]["lengths"]) if test_stats[task]["lengths"] else 0
+            #         # 记录测试数据
+            #         test_data[f"test/{task}/mean_return"] = task_mean_test_return
+            #         test_data[f"test/{task}/std_return"] = task_std_test_return
+            #         test_data[f"test/{task}/mean_length"] = np.mean(test_stats[task]["lengths"]) if test_stats[task]["lengths"] else 0
                     
-                    # 如果有win_rate统计，也记录它
-                    if test_stats[task]["win_rates"]:
-                        test_win_rate = np.mean(test_stats[task]["win_rates"])
-                        test_data[f"test/{task}/win_rates"] = test_win_rate
+            #         # 如果有win_rate统计，也记录它
+            #         if test_stats[task]["win_rates"]:
+            #             test_win_rate = np.mean(test_stats[task]["win_rates"])
+            #             test_data[f"test/{task}/win_rates"] = test_win_rate
 
                 
-                # 记录测试时间
-                test_data["test/test_time"] = time.time() - test_start_time
+            #     # 记录测试时间
+            #     test_data["test/test_time"] = time.time() - test_start_time
                 
-                # 记录测试数据
-                wandb.log(test_data, step=current_t_env)
+            #     # 记录测试数据
+            #     wandb.log(test_data, step=current_t_env)
                 
-                # 添加测试评估标记点
-                wandb.log({"test/evaluation": current_t_env}, step=current_t_env)
+            #     # 添加测试评估标记点
+            #     wandb.log({"test/evaluation": current_t_env}, step=current_t_env)
             
-            # 记录测试统计到日志
-            for task in test_tasks:
-                task_mean_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
-                logger.log_stat(f"test_return_mean_{task}", task_mean_return, current_t_env)
+            # # 记录测试统计到日志
+            # for task in test_tasks:
+            #     task_mean_return = np.mean(test_stats[task]["returns"]) if test_stats[task]["returns"] else 0
+            #     logger.log_stat(f"test_return_mean_{task}", task_mean_return, current_t_env)
                 
-                if test_stats[task]["win_rates"]:
-                    win_rate = np.mean(test_stats[task]["win_rates"])
-                    logger.log_stat(f"test_win_rate_{task}", win_rate, current_t_env)
+            #     if test_stats[task]["win_rates"]:
+            #         win_rate = np.mean(test_stats[task]["win_rates"])
+            #         logger.log_stat(f"test_win_rate_{task}", win_rate, current_t_env)
             
-            test_time_total += time.time() - test_start_time
+            # test_time_total += time.time() - test_start_time
             
             logger.console_logger.info("Online Step: {} / {}".format(current_t_env, main_args.online_steps))
             logger.console_logger.info(
@@ -914,10 +927,17 @@ def run_sequential(args, logger):
             main_args.t_max
         )
     )
-    # Stage 1 : train each task with offline data
     if main_args.load_wm_path != "":
         learner.load_models(main_args.load_wm_path)
-    if getattr(main_args, "use_offline_training", False) and main_args.load_wm_path == "":
+        if getattr(main_args,"test_offline_model", False):
+            # test the offline model
+            for task in main_args.test_tasks:
+                task2runner[task].t_env = 0
+                for _ in range(main_args.test_nepisode):
+                    task2runner[task].run(test_mode=True, pretrain=False)
+            return
+    # Stage 1 : train each task with offline data
+    if getattr(main_args, "use_offline_training", False):
         train_sequential(
             main_args.train_tasks,
             main_args,

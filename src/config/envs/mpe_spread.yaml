@@ -1,0 +1,7 @@
+env_args:
+  # key: "simple_spread_v3" # Corresponds to the PettingZoo MPE environment name
+  scenario_name: "simple_spread"
+  episode_limit: 25 # Default episode time limit
+  benchmark: False # Whether to benchmark the environment
+  # n_agents: 3 # Default number of agents for simple_spread_v3
+  # Add any other MPE specific arguments here if needed by MPEWrapper or the env itself

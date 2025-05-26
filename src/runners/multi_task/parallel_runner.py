@@ -88,7 +88,7 @@ class ParallelRunner:
         self.t = 0
         self.env_steps_this_run = 0
 
-    def run(self, test_mode=False, pretrain_phase=False):
+    def run(self, test_mode=False, pretrain=False):
         self.reset()
 
         all_terminated = False
@@ -103,11 +103,11 @@ class ParallelRunner:
 
             # Pass the entire batch of experiences up till now to the agents
             # Receive the actions for each agent at this timestep in a batch for each un-terminated env
-            if pretrain_phase:
+            if pretrain:
                 # If pretrain phase, just select action randomly
                 actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=0, task=self.task, bs=envs_not_terminated, test_mode=False)
             else:
-                actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, task=self.task, bs=envs_not_terminated, test_mode=test_mode)
+                actions, _ = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, task=self.task, bs=envs_not_terminated, test_mode=test_mode)
         
             cpu_actions = actions.to("cpu").numpy()
 
@@ -189,7 +189,7 @@ class ParallelRunner:
             env_stat = parent_conn.recv()
             env_stats.append(env_stat)
 
-        if not pretrain_phase:        
+        if not pretrain:        
             cur_stats = self.test_stats if test_mode else self.train_stats
             cur_returns = self.test_returns if test_mode else self.train_returns
             log_prefix = f"{self.task}/test_" if test_mode else f"{self.task}/"

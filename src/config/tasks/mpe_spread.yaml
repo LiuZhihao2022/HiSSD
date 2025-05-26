@@ -1,0 +1,14 @@
+dataset: simple_spread/expert
+env: mpe
+pretrain_tasks:
+- simple_spread
+pretrain_tasks_data_quality:
+  simple_spread: expert
+task: marine-easy-expert
+test_tasks:
+- simple_spread
+test_tasks_data_quality: {}
+train_tasks:
+- simple_spread
+train_tasks_data_quality:
+  simple_spread: expert

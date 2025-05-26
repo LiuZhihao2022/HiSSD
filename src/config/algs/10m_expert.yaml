@@ -80,7 +80,7 @@ debug: False
 batch_size: 8 # specially for episode runner
 batch_size_run: 8
 c_step: 5
-load_wm_path: "/home/liuzhihao/HiSSD/sc2_model_3m_5m/marine-easy-expert/10m_expert/251000"
+load_wm_path: "/home/lzh/HiSSD/sc2_model_3m_5m/marine-easy-expert/10m_expert/251000"
 # load_wm_path: ""
 use_offline_training: False
 use_online_mcts: True # 暂时wm和mcts分开学, 只学stage 1
@@ -103,5 +103,5 @@ offline_value_anneal_time: 500000
 save_model_interval_online: 50000
 test_nepisode_online: 20
 test_interval_online: 50000
-compute_infonce: True
+compute_infonce: False
 use_wandb: True

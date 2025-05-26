@@ -211,13 +211,30 @@ def gumbel_muzero_policy(
   # children_index: [B, N, num_actions]，N=节点数，ROOT_INDEX=0
   child_indices = search_tree.children_index[batch_range, search_tree.ROOT_INDEX, action]  # [B]
   # wm_hidden_states: [B, N, ...]
+
+  # policy hidden state返回root节点的hidden state就行。因为root节点的就是通过initialize root,相当于是计算过一次后得到的
+  # wm hidden state我们是假设通过动作选择后才得到的(reward一定是，value我们暂时也设置为这样，在外面计算的不拿进来)，所以要使用child_indices
+  # 哪个更好，并不会因为它选哪个就改变hidden state，所以这里返回root的
   new_wm_hidden_states = search_tree.wm_hidden_states[batch_range, child_indices]
-  new_policy_hidden_states = search_tree.policy_hidden_states[batch_range, child_indices]
-  new_critic_hidden_states = search_tree.critic_hidden_states[batch_range, child_indices]
+  # new_policy_hidden_states = search_tree.policy_hidden_states[batch_range, child_indices]
+  # new_critic_hidden_states = search_tree.critic_hidden_states[batch_range, child_indices]
+  # new_wm_hidden_states = search_tree.wm_hidden_states[batch_range, search_tree.ROOT_INDEX]
+  new_policy_hidden_states = search_tree.policy_hidden_states[batch_range, search_tree.ROOT_INDEX]
+  new_critic_hidden_states = search_tree.critic_hidden_states[batch_range, search_tree.ROOT_INDEX]
+  # -------------------------------------------------------------------
+  root_idx = 0
+  max_visit_init = 50.00
+  value_scale = 0.1
+  visit_count = search_tree.children_visits[batch_range, root_idx]
+  max_visit = np.max(visit_count, axis=-1, keepdims=True)
+  visit_scale = max_visit + max_visit_init
+  transformed_adv = visit_scale * value_scale * advantages
+  # -------------------------------------------------------------------
   # Producing action_weights usable to train the policy network.
   completed_search_logits = _mask_invalid_actions(
-      root.prior_logits + completed_qvalues, invalid_actions)
+      root.prior_logits + transformed_adv, invalid_actions)
   # action_weights就是改善后的策略分布
+
   action_weights = jax.nn.softmax(completed_search_logits)
   return base.PolicyOutput(
       action=action,

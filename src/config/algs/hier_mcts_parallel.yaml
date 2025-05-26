@@ -7,7 +7,7 @@ epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
 # update the target network every _ steps
-target_update_interval: 80
+target_update_interval: 200
 
 # use the Q_Learner to train
 agent_output_type: "q"
@@ -77,16 +77,16 @@ adaptation: False
 debug: False
 
 # -----------------------hier-mcts params-----------------------
-batch_size: 2 # specially for episode runner
-batch_size_run: 2
+batch_size: 8 # specially for episode runner
+batch_size_run: 8
 c_step: 5
-# load_wm_path: "/home/lzh/HiSSD/results/hier_mcts/sc2/marine-easy-expert/3m-medium/mcts/mcts_2025-04-18_13-50-25/models/1"
+# load_wm_path: "/home/lzh/HiSSD/sc2_model_3m_5m/marine-easy-expert/3m-expert/mcts/mcts_2025-04-18_19-25-27/models/251000"
 load_wm_path: ""
 use_offline_training: True
-# use_online_mcts: True # 暂时wm和mcts分开学, 只学stage 1
+use_online_mcts: False # 暂时wm和mcts分开学, 只学stage 1
 online_steps: 2000500
 # 可以存放多少条数据，不过这个是要和buffer每次采样的size相关的
-replay_buffer_list_capacity: 2000
+replay_buffer_list_capacity: 200
 # target_update_interval: 200
 num_simulations: 32
 max_num_considered_actions: 16

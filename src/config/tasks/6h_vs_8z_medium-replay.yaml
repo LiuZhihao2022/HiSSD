@@ -1,0 +1,14 @@
+dataset: 6h_vs_8z/medium-replay
+env: sc2
+pretrain_tasks:
+- 6h_vs_8z
+pretrain_tasks_data_quality:
+  6h_vs_8z: medium-replay
+task: marine-easy-medium-replay
+test_tasks:
+- 6h_vs_8z
+test_tasks_data_quality: {}
+train_tasks:
+- 6h_vs_8z
+train_tasks_data_quality:
+  6h_vs_8z: medium-replay

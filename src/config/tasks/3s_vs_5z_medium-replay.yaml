@@ -1,0 +1,14 @@
+dataset: 3s_vs_5z/medium-replay
+env: sc2
+pretrain_tasks:
+- 3s_vs_5z
+pretrain_tasks_data_quality:
+  3s_vs_5z: medium-replay
+task: marine-easy-medium-replay
+test_tasks:
+- 3s_vs_5z
+test_tasks_data_quality: {}
+train_tasks:
+- 3s_vs_5z
+train_tasks_data_quality:
+  3s_vs_5z: medium-replay

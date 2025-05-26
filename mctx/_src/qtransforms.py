@@ -87,7 +87,7 @@ def qtransform_completed_by_mix_value(
     node_index: chex.Numeric,
     *,
     value_scale: chex.Numeric = 0.1,
-    maxvisit_init: chex.Numeric = 50.0,
+    maxvisit_init: chex.Numeric = 50.00,
     rescale_values: bool = True,
     use_mixed_value: bool = True,
     epsilon: chex.Numeric = 1e-8,

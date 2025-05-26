@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-
+import copy
 import numpy as np
 
 
@@ -27,16 +27,18 @@ class SkillModule(nn.Module):
         self.emb = NearestEmbedEMA(self.skill_dim, self.code_dim) if self.vq_ema else NearestEmbed(self.skill_dim, self.code_dim)
         self.all_params = list(self.emb.parameters()) + list(self.skill_encoder.parameters()) + list(self.skill_decoder.parameters())
 
-    def forward(self, emb_inputs):
+    def forward(self, emb_inputs, training=True):
         # z_e = self.skill_encoder(seq['deter']).mean
         shape = list(emb_inputs.shape)
         z_e = self.skill_encoder(emb_inputs).reshape(-1, self.code_dim)
 
         if self.vq_ema: # TODO:在使用的时候，要把这个改成False，codebook保持不变了
-            emb, skill_index = self.emb(z_e, training=True)
+            emb, skill_index = self.emb(z_e, training=training, allow_grad=False)  # 调用时禁用梯度
+            # 这个是要让输入尽可能贴近embedding，因为skill是离散的，而且要根据z_e的值从emb.weight中进行选择，所以还是尽可能贴embedding吧
             commit_loss = F.mse_loss(z_e, emb.detach())
             emb = self.skill_decoder(emb).reshape(*list(shape))
             diverse_loss = self.compute_emb_diverse_loss()
+            vq_loss = torch.tensor(0.).to(emb_inputs.device)
             return emb, skill_index, self.comit_coef*commit_loss, self.diver_coef*diverse_loss
             # recon = self.skill_decoder(emb).mean
 
@@ -46,17 +48,18 @@ class SkillModule(nn.Module):
             # loss = rec_loss + self.comit_coef*commit_loss
             # return loss, {'rec_loss': rec_loss, 'commit_loss': commit_loss}
         else:
-            z_q, _ = self.emb(z_e, weight_sg=True)
+            z_q, skill_index = self.emb(z_e, weight_sg=True)
             emb, _ = self.emb(z_e.detach())
             # reconstruction loss
-            recon = self.skill_decoder(z_q).mean
+            # recon = self.skill_decoder(z_q).mean
 
-            rec_loss = F.mse_loss(recon, emb_inputs)
+            # rec_loss = F.mse_loss(recon, emb_inputs)
+            emb = self.skill_decoder(emb).reshape(*list(shape))
             vq_loss = F.mse_loss(emb, z_e.detach())
             commit_loss = F.mse_loss(z_e, emb.detach())
-
-            loss = rec_loss + self.vq_coef*vq_loss + self.comit_coef*commit_loss
-            return loss, {'rec_loss': rec_loss, 'vq_loss' : vq_loss, 'commit_loss': commit_loss}
+            diverse_loss = self.compute_emb_diverse_loss()
+            # loss = diverse_loss + self.vq_coef*vq_loss + self.comit_coef*commit_loss
+            return emb, skill_index, self.comit_coef*commit_loss, self.diver_coef*diverse_loss, self.vq_coef*vq_loss
         
     def compute_emb_diverse_loss(self):
         """
@@ -65,8 +68,8 @@ class SkillModule(nn.Module):
         # 1. 获取embedding权重
         emb_weight = self.emb.weight  # (skill_dim, code_dim)
 
-        # 2. 归一化后计算 pairwise 相似度
-        norm_emb = F.normalize(emb_weight, dim=1)  # 单位化
+        # 2. 归一化后计算 pairwise 相似度。每一列为skill，所以按照dim=0进行单位化
+        norm_emb = F.normalize(emb_weight, dim=0)  # 单位化
         similarity_matrix = torch.matmul(norm_emb, norm_emb.T)  # (skill_dim, skill_dim)
 
         # 3. 只取上三角（不含对角线）
@@ -78,6 +81,34 @@ class SkillModule(nn.Module):
         diverse_loss = (pairwise_similarities ** 2).mean()
 
         return diverse_loss
+
+    def forward_with_skill_index(self, emb_inputs, skill_index):
+        """
+        使用给定的skill_index来获取embedding并与输入特征融合
+        
+        Args:
+            emb_inputs: 输入特征，形状为(batch_size, entity_embed_dim)
+            skill_index: 技能索引，形状为(batch_size,)
+            
+        Returns:
+            融合后经过解码器的输出
+        """
+        shape = list(emb_inputs.shape)
+        z_e = self.skill_encoder(emb_inputs).reshape(-1, self.code_dim)
+        
+        # 从embedding中获取对应的skill向量，允许梯度传递
+        # self.emb.weight的形状为(emb_dim, num_emb)，转置后变为(num_emb, emb_dim)
+        skill_emb = self.emb.weight.t()[skill_index]  # 形状为(batch_size, code_dim)
+        
+        # 将z_e和skill_emb相加
+        combined_emb = z_e + skill_emb.reshape(z_e.shape)
+        
+        # 通过解码器输出
+        output = self.skill_decoder(combined_emb).reshape(*shape)
+        diverse_loss = self.compute_emb_diverse_loss()
+
+        # 每一个动作的emb都是固定的哪一个位置的序列，通过skill_index进行指定，不需要贴近，所以没有commit_loss
+        return output, torch.tensor(0.).to(emb_inputs.device), self.diver_coef*diverse_loss
 
 
 class NearestEmbedFunc(torch.autograd.Function):
@@ -173,7 +204,11 @@ class NearestEmbedEMA(nn.Module):
         self.n_emb = n_emb
         self.emb_dim = emb_dim
         embed = torch.rand(emb_dim, n_emb)
+        
+        # 将weight改为parameter而不是buffer，使其可以有梯度
+        # self.weight = nn.Parameter(embed)
         self.register_buffer('weight', embed)
+        
         self.register_buffer('cluster_size', torch.zeros(n_emb))
         self.register_buffer('embed_avg', embed.clone())
         self.register_buffer('prev_cluster', torch.zeros(n_emb))
@@ -197,29 +232,32 @@ class NearestEmbedEMA(nn.Module):
         argmin : torch.Tensor
             Indices of the nearest embeddings.
         '''
-    def forward(self, x, *args, training=False, **kwargs):
+    def forward(self, x, *args, training=False, allow_grad=False, **kwargs):
         """Input:
         ---------
         x - (batch_size, emb_size, *)
         """
+        # 根据allow_grad决定是否使用权重的梯度
+        weight = self.weight if allow_grad else self.weight.detach()
 
         dims = list(range(len(x.size())))
         x_expanded = x.unsqueeze(-1)
         num_arbitrary_dims = len(dims) - 2
         if num_arbitrary_dims:
-            emb_expanded = self.weight.view(
+            emb_expanded = weight.view(
                 self.emb_dim, *([1] * num_arbitrary_dims), self.n_emb)
         else:
-            emb_expanded = self.weight
+            emb_expanded = weight
 
         # find nearest neighbors
         dist = torch.norm(x_expanded - emb_expanded, 2, 1)
         _, argmin = dist.min(-1)
         shifted_shape = [x.shape[0], *list(x.shape[2:]), x.shape[1]]
-        result = self.weight.t().index_select(
+        result = weight.t().index_select(
             0, argmin.view(-1)).view(shifted_shape).permute(0, dims[-1], *dims[1:-1])
 
         if training:
+            # 训练过程中更新codebook
             latent_indices = torch.arange(self.n_emb).type_as(argmin)
             emb_onehot = (argmin.view(-1, 1) ==
                           latent_indices.view(1, -1)).type_as(x.data)
@@ -245,6 +283,7 @@ class NearestEmbedEMA(nn.Module):
             cluster_size = (self.cluster_size + self.eps) / (n + self.n_emb * self.eps) * n
 
             embed_normalized = self.embed_avg / cluster_size.unsqueeze(0)
+            # 更新权重数据而不是整个参数
             self.weight.data.copy_(embed_normalized)
         # 梯度不流向codebook，只流向输入
         result = x + (result - x).detach()

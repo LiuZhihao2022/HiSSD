@@ -362,6 +362,7 @@ def backward(
     return tree, leaf_value, parent
 
   leaf_index = jnp.asarray(leaf_index, dtype=jnp.int32)
+  # 这里是将叶子节点的value传入，作为叶子节点的评估，所以后续backward其实都是带着value进行backward的
   loop_state = (tree, tree.node_values[leaf_index], leaf_index)
   tree, _, _ = jax.lax.while_loop(cond_fun, body_fun, loop_state)
 

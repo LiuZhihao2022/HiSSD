@@ -5,7 +5,7 @@
     "max_num_considered_actions": 16,
     "qtransform": "qtransform_completed_by_mix_value",
     "qtransform_kwargs": {
-      "maxvisit_init": 50.0,
+      "maxvisit_init": 50.00,
       "rescale_values": false,
       "value_scale": 0.5
     }
